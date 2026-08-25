@@ -1,0 +1,30 @@
+{
+	"name": "pi-extension-terminal",
+	"version": "0.1.0",
+	"description": "pi extension: embedded PTY-backed terminal pane toggled with Ctrl+/ — state persists while hidden, dies on quit",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"terminal",
+		"pty"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/terminal"
+	},
+	"dependencies": {
+		"@xterm/headless": "^5.5.0",
+		"node-pty": "^1.1.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}

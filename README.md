@@ -9,6 +9,7 @@ A collection of custom [pi](https://pi.dev) packages, each installable separatel
 | [`packages/cursor`](./packages/cursor) | Use Cursor subscription models via the `cursor-agent` CLI bridge |
 | [`packages/worktree`](./packages/worktree) | Manage git worktrees with tmux-integrated pi agents |
 | [`packages/open-current-folder`](./packages/open-current-folder) | Open the current folder in `$EDITOR` with Ctrl+E |
+| [`packages/terminal`](./packages/terminal) | Embedded PTY terminal pane toggled with Ctrl+/ |
 
 ## Install
 
