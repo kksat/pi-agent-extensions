@@ -3,7 +3,13 @@
 	"version": "0.1.0",
 	"description": "pi extension: use your Cursor subscription models (Composer, Claude, GPT, Gemini, Grok) via the cursor-agent CLI bridge",
 	"type": "module",
-	"keywords": ["pi-package", "pi-extension", "cursor", "models", "provider"],
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"cursor",
+		"models",
+		"provider"
+	],
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
@@ -14,6 +20,9 @@
 		"@earendil-works/pi-coding-agent": "*"
 	},
 	"pi": {
-		"extensions": ["./index.ts"]
-	}
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
 }

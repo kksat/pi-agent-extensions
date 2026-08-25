@@ -1,9 +1,14 @@
 {
 	"name": "pi-extension-worktree",
 	"version": "0.1.0",
-	"description": "pi extension: manage git worktrees with seamless tmux integration — spin off isolated worktrees running pi agents without prompts",
+	"description": "pi extension: manage git worktrees with seamless tmux integration \u2014 spin off isolated worktrees running pi agents without prompts",
 	"type": "module",
-	"keywords": ["pi-package", "pi-extension", "worktree", "tmux"],
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"worktree",
+		"tmux"
+	],
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
@@ -15,6 +20,9 @@
 		"typebox": "*"
 	},
 	"pi": {
-		"extensions": ["./index.ts"]
-	}
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
 }

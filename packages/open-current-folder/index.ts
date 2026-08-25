@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-only
+SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
+*/
+
 /**
  * Open Current Folder in $EDITOR (Neovim)
  *

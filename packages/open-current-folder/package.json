@@ -3,7 +3,12 @@
 	"version": "0.1.0",
 	"description": "pi extension: open the current folder in $EDITOR (Neovim) with Ctrl+E and clean terminal state management",
 	"type": "module",
-	"keywords": ["pi-package", "pi-extension", "editor", "neovim"],
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"editor",
+		"neovim"
+	],
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
@@ -13,6 +18,9 @@
 		"@earendil-works/pi-coding-agent": "*"
 	},
 	"pi": {
-		"extensions": ["./index.ts"]
-	}
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
 }
