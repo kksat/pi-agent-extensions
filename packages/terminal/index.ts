@@ -3,22 +3,36 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
 */
 
 /**
- * pi-terminal - embedded terminal inside pi
+ * pi-terminal - embedded terminals inside pi
  *
- * Toggle a real PTY-backed terminal pane inside pi with ctrl+/.
- * - First press: creates the terminal session and shows it
+ * Toggle real PTY-backed terminal panes inside pi.
+ * - First press: creates the terminal session and shows it (optionally
+ *   running a configured command inside it)
  * - Later presses: shows/hides the existing session (state is preserved)
- * - While the terminal has focus, ctrl+/ hides it and returns to pi
+ * - While a terminal has focus, its hotkey hides it and returns to pi;
+ *   a different terminal's hotkey switches straight to that terminal
  *
- * The terminal keeps running while hidden, so long-running commands keep
- * going. It only dies when you quit pi.
+ * Terminals and their hotkeys are configured in ~/.pi/agent/pi-terminal.json:
+ *
+ *   {
+ *     "terminals": [
+ *       { "key": "ctrl+/" },
+ *       { "key": "alt+e", "command": "nvim", "name": "editor" }
+ *     ]
+ *   }
+ *
+ * Each entry gets its own independent terminal session. If no config file
+ * exists, a single plain terminal on ctrl+/ is provided.
+ *
+ * The terminals keep running while hidden, so long-running commands keep
+ * going. They only die when you quit pi.
  *
  * Limitations: mouse events are not forwarded to programs running inside
- * the pane.
+ * the panes.
  */
 
 import { execPath } from "node:process";
-import { chmodSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { delimiter, join, sep } from "node:path";
 import { spawn } from "node-pty";
 import type { IPty } from "node-pty";
@@ -26,16 +40,104 @@ import { Terminal } from "@xterm/headless";
 import type { IBufferCell } from "@xterm/headless";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, matchesKey } from "@earendil-works/pi-tui";
+import type { KeyId } from "@earendil-works/pi-tui";
+import { homedir } from "node:os";
 
-const TOGGLE_KEY = "ctrl+/";
-// On legacy (non-Kitty) terminals ctrl+/ sends byte 0x1f which pi-tui parses
-// as "ctrl+_", so we register/handle both.
-const TOGGLE_KEYS = [TOGGLE_KEY, "ctrl+_"];
-const RAW_TOGGLE_BYTE = "\x1f";
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-function isToggleKey(data: string): boolean {
-	if (data === RAW_TOGGLE_BYTE) return true;
-	return TOGGLE_KEYS.some((key) => matchesKey(data, key));
+interface TerminalEntry {
+	id: string;
+	key: string;
+	/** Legacy aliases registered alongside the main key (see below). */
+	aliases: string[];
+	/** Optional command run inside the terminal when it is first created. */
+	command?: string;
+	/** Human-readable label for notifications. */
+	name: string;
+	/** Raw byte sequences this key can arrive as (matched in handleInput). */
+	raw: string[];
+}
+
+/**
+ * Raw byte sequences a key binding can arrive as on non-Kitty terminals.
+ * Only simple ctrl/alt + single-letter combos are covered; everything else
+ * relies on matchesKey() alone.
+ */
+function rawSequencesFor(key: string): string[] {
+	const parts = key.split("+");
+	const base = parts[parts.length - 1];
+	const out: string[] = [];
+	if (base && base.length === 1 && /[a-z]/.test(base)) {
+		if (parts.includes("ctrl") && !parts.includes("alt")) {
+			out.push(String.fromCharCode(base.charCodeAt(0) - 0x60));
+		}
+		if (parts.includes("alt") && !parts.includes("ctrl")) {
+			out.push(`\x1b${base}`);
+		}
+	}
+	return out;
+}
+
+/** Load terminal entries from ~/.pi/agent/pi-terminal.json (or defaults). */
+function loadEntries(): TerminalEntry[] {
+	let list:
+		| Array<{ key?: string; command?: string; name?: string }>
+		| undefined;
+	try {
+		const configPath = join(homedir(), ".pi", "agent", "pi-terminal.json");
+		if (existsSync(configPath)) {
+			const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
+			if (Array.isArray(parsed)) list = parsed;
+			else if (parsed && typeof parsed === "object" && Array.isArray((parsed as { terminals?: unknown }).terminals)) {
+				list = (parsed as { terminals: Array<{ key?: string; command?: string; name?: string }> }).terminals;
+			}
+		}
+	} catch {
+		// malformed config -> fall back to defaults
+	}
+
+	const source = list ?? [{ key: "ctrl+/" }];
+	const out: TerminalEntry[] = [];
+	for (const [i, raw] of source.entries()) {
+		if (!raw || typeof raw.key !== "string" || raw.key === "") continue;
+		const label = raw.name ?? raw.command ?? "Terminal";
+		out.push({
+			id: raw.name ?? raw.command ?? `terminal-${i + 1}`,
+			key: raw.key,
+			// On legacy (non-Kitty) terminals ctrl+/ sends byte 0x1f which
+			// pi-tui parses as "ctrl+_", so we register/handle both.
+			aliases: raw.key === "ctrl+/" ? ["ctrl+_"] : [],
+			command: typeof raw.command === "string" && raw.command !== "" ? raw.command : undefined,
+			name: label,
+			raw: rawSequencesFor(raw.key),
+		});
+	}
+	if (out.length === 0) {
+		out.push({ id: "default", key: "ctrl+/", aliases: ["ctrl+_"], name: "Terminal", raw: ["\x1f"] });
+	}
+	return out;
+}
+
+/**
+ * Cast a config-supplied key string to pi-tui's KeyId type. The runtime
+ * accepts any "modifier+key" string; the union only exists for autocomplete.
+ */
+function asKeyId(key: string): KeyId {
+	return key as KeyId;
+}
+
+const entries = loadEntries();
+
+/** Which configured entry does this input chunk belong to, if any? */
+function matchEntry(data: string): TerminalEntry | null {
+	for (const entry of entries) {
+		if (entry.raw.includes(data)) return entry;
+		if (matchesKey(data, asKeyId(entry.key))) return entry;
+		if (entry.aliases.some((alias) => matchesKey(data, asKeyId(alias)))) return entry;
+	}
+	return null;
 }
 
 interface OverlayHandleLike {
@@ -46,6 +148,7 @@ interface OverlayHandleLike {
 }
 
 interface TerminalSession {
+	entry: TerminalEntry;
 	term: Terminal;
 	pty: IPty;
 	handle: OverlayHandleLike | null;
@@ -55,7 +158,9 @@ interface TerminalSession {
 	rows: number;
 }
 
-let session: TerminalSession | null = null;
+const sessions = new Map<string, TerminalSession>();
+/** Handlers per entry id, used to switch between terminals from handleInput. */
+const entryHandlers = new Map<string, (ctx: ExtensionContext) => Promise<void>>();
 
 function desiredRows(tuiHeight: number): number {
 	// Fill the full height (minus a small margin for pi's own chrome)
@@ -317,7 +422,7 @@ function pathJoin(...parts: string[]): string {
 	return parts.join(sep);
 }
 
-function createSession(ctx: ExtensionContext): TerminalSession {
+function createSession(ctx: ExtensionContext, entry: TerminalEntry): TerminalSession {
 	ensureSpawnHelperExecutable();
 
 	const shell = process.env.SHELL || "/bin/zsh";
@@ -343,7 +448,7 @@ function createSession(ctx: ExtensionContext): TerminalSession {
 		},
 	});
 
-	return { term, pty, handle: null, done: null, visible: false, cols, rows };
+	return { entry, term, pty, handle: null, done: null, visible: false, cols, rows };
 }
 
 function destroySession(s: TerminalSession): void {
@@ -355,9 +460,15 @@ function destroySession(s: TerminalSession): void {
 	s.term.dispose();
 }
 
-async function openTerminal(ctx: ExtensionContext): Promise<void> {
-	const s = createSession(ctx);
-	session = s;
+async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
+	const s = createSession(ctx, entry);
+	sessions.set(entry.id, s);
+
+	// Run the configured command (if any) once the shell is up. Input written
+	// before the shell reads it is buffered by the tty line discipline.
+	if (entry.command) {
+		s.pty.write(`${entry.command}\r`);
+	}
 
 	await ctx.ui.custom(
 		(tui, _theme, _keybindings, done) => {
@@ -367,9 +478,9 @@ async function openTerminal(ctx: ExtensionContext): Promise<void> {
 				s.term.write(data, () => tui.requestRender());
 			});
 			s.pty.onExit(() => {
-				if (session === s) {
-					session = null;
-					ctx.ui.notify("Terminal exited", "info");
+				if (sessions.get(entry.id) === s) {
+					sessions.delete(entry.id);
+					ctx.ui.notify(`${s.entry.name} exited`, "info");
 					s.done?.();
 				}
 			});
@@ -402,8 +513,18 @@ async function openTerminal(ctx: ExtensionContext): Promise<void> {
 				},
 
 				handleInput(data: string): void {
-					if (isToggleKey(data)) {
-						hideTerminal(s, ctx);
+					const hit = matchEntry(data);
+					if (hit) {
+						if (hit.id === entry.id) {
+							// Same terminal's hotkey while focused -> hide it
+							hideTerminal(s, ctx);
+						} else {
+							// Another terminal's hotkey -> hide this one and switch
+							hideTerminal(s, ctx);
+							setTimeout(() => {
+								void entryHandlers.get(hit.id)?.(ctx);
+							}, 0);
+						}
 						return;
 					}
 					s.pty.write(translateInput(data));
@@ -425,8 +546,8 @@ async function openTerminal(ctx: ExtensionContext): Promise<void> {
 	);
 
 	// done() fired (pty exited or shutdown): clean up remaining state
-	if (session === s) {
-		session = null;
+	if (sessions.get(entry.id) === s) {
+		sessions.delete(entry.id);
 		destroySession(s);
 	}
 }
@@ -435,22 +556,17 @@ function hideTerminal(s: TerminalSession, ctx: ExtensionContext): void {
 	s.visible = false;
 	s.handle?.setHidden(true);
 	s.handle?.unfocus({ target: null });
-	ctx.ui.notify(`Terminal hidden (${TOGGLE_KEY} to show)`, "info");
+	ctx.ui.notify(`${s.entry.name} hidden (${s.entry.key} to show)`, "info");
 }
 
 export default function (pi: ExtensionAPI) {
-	for (const key of TOGGLE_KEYS) {
-		pi.registerShortcut(key, {
-			description: "Toggle embedded terminal pane",
-			handler: toggleHandler,
-		});
-	}
-
-	async function toggleHandler(ctx: ExtensionContext) {
+	async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify("Terminal requires interactive mode", "error");
 			return;
 		}
+
+		const session = sessions.get(entry.id);
 
 		// Hidden but alive -> show it again
 		if (session && !session.visible && session.handle) {
@@ -466,16 +582,27 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// No terminal yet -> create and show it
-		await openTerminal(ctx);
+		// No terminal yet -> create and show it, running any configured command
+		await openTerminal(ctx, entry);
+	}
+
+	for (const entry of entries) {
+		entryHandlers.set(entry.id, (ctx) => handler(ctx, entry));
+		const description = entry.command
+			? `${entry.name} terminal (${entry.command})`
+			: `Toggle embedded ${entry.name.toLowerCase()} terminal`;
+		for (const key of [entry.key, ...entry.aliases]) {
+			pi.registerShortcut(asKeyId(key), { description, handler: (ctx) => handler(ctx, entry) });
+		}
 	}
 
 	pi.on("session_shutdown", async (event) => {
-		if (!session) return;
-		// Keep the terminal across /new, /resume, /fork; kill it when quitting.
-		if (event.reason === "quit") {
-			const s = session;
-			session = null;
+		if (sessions.size === 0) return;
+		// Keep the terminals across /new, /resume, /fork; kill them when quitting.
+		if (event.reason !== "quit") return;
+		const all = [...sessions.values()];
+		sessions.clear();
+		for (const s of all) {
 			s.done = null; // don't resolve the custom UI during shutdown
 			destroySession(s);
 		}
