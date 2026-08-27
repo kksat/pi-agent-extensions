@@ -1,0 +1,30 @@
+{
+	"name": "pi-extension-vim",
+	"version": "0.1.0",
+	"description": "pi extension: full-featured Vim modal editing for the Pi prompt editor",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"vim",
+		"vim-mode",
+		"modal-editing",
+		"editor"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/vim"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}
