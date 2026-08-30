@@ -27,8 +27,8 @@ export default function (pi: ExtensionAPI) {
 				// 1. Stop Pi's TUI and release the terminal
 				tui.stop();
 
-				// 2. Clear screen and switch to normal terminal buffer
-				process.stdout.write("\x1b[2J\x1b[H");
+				// 2. Clear screen, home cursor, and explicitly show cursor
+				process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
 
 				try {
 					// 3. Run editor synchronously with full interactive stdio

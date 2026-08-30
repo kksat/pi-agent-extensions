@@ -156,6 +156,8 @@ interface TerminalSession {
 	visible: boolean;
 	cols: number;
 	rows: number;
+	tui: TUI | null;
+	prevShowHardwareCursor: boolean;
 }
 
 const sessions = new Map<string, TerminalSession>();
@@ -363,6 +365,11 @@ export function renderRow(term: Terminal, y: number, cursorX: number, cursorY: n
 		x += width;
 	}
 
+	if (!markerWritten && y === cursorY) {
+		out += CURSOR_MARKER;
+		markerWritten = true;
+	}
+
 	return out;
 }
 
@@ -448,7 +455,18 @@ function createSession(ctx: ExtensionContext, entry: TerminalEntry): TerminalSes
 		},
 	});
 
-	return { entry, term, pty, handle: null, done: null, visible: false, cols, rows };
+	return {
+		entry,
+		term,
+		pty,
+		handle: null,
+		done: null,
+		visible: false,
+		cols,
+		rows,
+		tui: null,
+		prevShowHardwareCursor: false,
+	};
 }
 
 function destroySession(s: TerminalSession): void {
@@ -472,7 +490,14 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 
 	await ctx.ui.custom(
 		(tui, _theme, _keybindings, done) => {
-			s.done = () => done(undefined);
+			s.tui = tui;
+			s.prevShowHardwareCursor = tui.getShowHardwareCursor();
+			tui.setShowHardwareCursor(true);
+
+			s.done = () => {
+				tui.setShowHardwareCursor(s.prevShowHardwareCursor);
+				done(undefined);
+			};
 
 			s.pty.onData((data) => {
 				s.term.write(data, () => tui.requestRender());
@@ -480,12 +505,15 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 			s.pty.onExit(() => {
 				if (sessions.get(entry.id) === s) {
 					sessions.delete(entry.id);
+					s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
 					ctx.ui.notify(`${s.entry.name} exited`, "info");
 					s.done?.();
 				}
 			});
 
 			return {
+				focused: true,
+
 				render(width: number): string[] {
 					const rows = desiredRows(tui.terminal.rows);
 					if (width !== s.cols || rows !== s.rows) {
@@ -500,10 +528,11 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 					}
 
 					const buf = s.term.buffer.active;
-					const base = Math.max(0, Math.min(buf.viewportY, buf.length - rows));
+					const base = Math.max(0, Math.min(buf.viewportY, Math.max(0, buf.length - rows)));
+					const targetCursorY = buf.baseY + buf.cursorY;
 					const lines: string[] = [];
 					for (let y = base; y < base + rows; y++) {
-						lines.push(renderRow(s.term, y, buf.cursorX, buf.cursorY));
+						lines.push(renderRow(s.term, y, buf.cursorX, targetCursorY));
 					}
 					return lines;
 				},
@@ -554,6 +583,7 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 
 function hideTerminal(s: TerminalSession, ctx: ExtensionContext): void {
 	s.visible = false;
+	s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
 	s.handle?.setHidden(true);
 	s.handle?.unfocus({ target: null });
 	ctx.ui.notify(`${s.entry.name} hidden (${s.entry.key} to show)`, "info");
@@ -571,6 +601,7 @@ export default function (pi: ExtensionAPI) {
 		// Hidden but alive -> show it again
 		if (session && !session.visible && session.handle) {
 			session.visible = true;
+			session.tui?.setShowHardwareCursor(true);
 			session.handle.setHidden(false);
 			session.handle.focus();
 			return;
@@ -603,6 +634,7 @@ export default function (pi: ExtensionAPI) {
 		const all = [...sessions.values()];
 		sessions.clear();
 		for (const s of all) {
+			s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
 			s.done = null; // don't resolve the custom UI during shutdown
 			destroySession(s);
 		}
