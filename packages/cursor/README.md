@@ -4,7 +4,7 @@ A [pi](https://pi.dev) extension that lets pi use the models of your Cursor subs
 
 ## How it works (bridge mode)
 
-- Model discovery runs `cursor-agent models` at startup and registers every model under a local `cursor` provider.
+- Model discovery uses a built-in default catalog and local cache (`~/.pi/agent/cursor-models.json`) at startup for instant initialization without blocking subprocess calls. Run `/cursor-models` to query `cursor-agent models` and refresh the cached model list.
 - For each request, the full pi conversation (system prompt, messages, tool schemas) is serialized into a single text prompt. The model is instructed to emit tool calls as one fenced JSON envelope instead of using cursor-agent's own built-in tools, because pi owns tool execution.
 - The prompt is piped to `cursor-agent --print --output-format stream-json --stream-partial-output`, and the stream-json events are translated into pi's `AssistantMessageEventStream` (thinking deltas, text deltas, usage).
 - A tool-call envelope found in the output is parsed into structured pi toolCall blocks so the normal pi agent loop continues.

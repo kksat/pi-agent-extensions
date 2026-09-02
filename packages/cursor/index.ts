@@ -10,8 +10,9 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  * approach the `@rama_nigg/open-cursor` opencode plugin uses.
  *
  * How it works (bridge mode):
- *  - Model discovery runs `cursor-agent models` at startup and registers every
- *    model under a local "cursor" provider.
+ *  - Model discovery uses a built-in default catalog and cache file
+ *    (`~/.pi/agent/cursor-models.json`) at startup for instant initialization.
+ *    Run `/cursor-models` to query `cursor-agent models` and refresh the cache.
  *  - For each request the full pi conversation (system prompt, messages, tool
  *    schemas) is serialized into a single text prompt. The model is instructed
  *    to emit tool calls as one fenced JSON envelope instead of using
@@ -32,6 +33,9 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  */
 
 import { execFile, spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import {
@@ -57,8 +61,10 @@ function resolveBin(): string {
 	return process.env.CURSOR_AGENT_BIN?.trim() || "cursor-agent";
 }
 
+const CACHE_FILE = join(homedir(), ".pi", "agent", "cursor-models.json");
+
 // ---------------------------------------------------------------------------
-// Model discovery
+// Model discovery & caching
 // ---------------------------------------------------------------------------
 
 interface DiscoveredModel {
@@ -66,6 +72,65 @@ interface DiscoveredModel {
 	name: string;
 	contextWindow: number;
 	reasoning: boolean;
+}
+
+const DEFAULT_MODELS: DiscoveredModel[] = [
+	{ id: "auto", name: "Auto", contextWindow: 400_000, reasoning: false },
+	{ id: "composer-2.5", name: "Composer 2.5", contextWindow: 400_000, reasoning: false },
+	{ id: "composer-1.5", name: "Composer 1.5", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.6-low", name: "Cursor Grok 4.6 Low", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.6-medium", name: "Cursor Grok 4.6 Medium", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.6-high", name: "Cursor Grok 4.6", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.6-xhigh", name: "Cursor Grok 4.6 Extra High", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.5-low", name: "Cursor Grok 4.5 Low", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.5-medium", name: "Cursor Grok 4.5 Medium", contextWindow: 400_000, reasoning: false },
+	{ id: "cursor-grok-4.5-high", name: "Cursor Grok 4.5", contextWindow: 400_000, reasoning: false },
+	{ id: "gpt-5.2", name: "GPT-5.2", contextWindow: 400_000, reasoning: false },
+	{ id: "gpt-5.4-high", name: "GPT-5.4 High", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-sonnet-5-low", name: "Claude Sonnet 5 Low", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-sonnet-5-medium", name: "Claude Sonnet 5 Medium", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-sonnet-5-high", name: "Claude Sonnet 5", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-sonnet-5-xhigh", name: "Claude Sonnet 5 Extra High", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-sonnet-5-thinking-low", name: "Claude Sonnet 5 Low Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-sonnet-5-thinking-medium", name: "Claude Sonnet 5 Medium Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-sonnet-5-thinking-high", name: "Claude Sonnet 5 Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-sonnet-5-thinking-xhigh", name: "Claude Sonnet 5 Extra High Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-4.6-sonnet-medium", name: "Claude Sonnet 4.6", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-4.6-sonnet-medium-thinking", name: "Claude Sonnet 4.6 Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-4.6-opus-high", name: "Claude Opus 4.6", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-4.6-opus-max", name: "Claude Opus 4.6 Max", contextWindow: 1_000_000, reasoning: false },
+	{ id: "claude-4.6-opus-high-thinking", name: "Claude Opus 4.6 Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-4.6-opus-max-thinking", name: "Claude Opus 4.6 Max Thinking", contextWindow: 1_000_000, reasoning: true },
+	{ id: "claude-4.5-opus-high", name: "Claude Opus 4.5", contextWindow: 400_000, reasoning: false },
+	{ id: "claude-4.5-opus-high-thinking", name: "Claude Opus 4.5 Thinking", contextWindow: 400_000, reasoning: true },
+	{ id: "claude-4.5-sonnet", name: "Claude Sonnet 4.5", contextWindow: 400_000, reasoning: false },
+	{ id: "claude-4.5-sonnet-thinking", name: "Claude Sonnet 4.5 Thinking", contextWindow: 400_000, reasoning: true },
+	{ id: "claude-4-sonnet", name: "Claude Sonnet 4", contextWindow: 400_000, reasoning: false },
+	{ id: "claude-4-sonnet-thinking", name: "Claude Sonnet 4 Thinking", contextWindow: 400_000, reasoning: true },
+	{ id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", contextWindow: 1_000_000, reasoning: false },
+	{ id: "gemini-3-flash", name: "Gemini 3 Flash", contextWindow: 1_000_000, reasoning: false },
+];
+
+function loadCachedModels(): DiscoveredModel[] {
+	if (existsSync(CACHE_FILE)) {
+		try {
+			const data = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
+			if (Array.isArray(data) && data.length > 0) {
+				return data;
+			}
+		} catch {
+			// fall through to defaults
+		}
+	}
+	return DEFAULT_MODELS;
+}
+
+function saveCachedModels(models: DiscoveredModel[]): void {
+	try {
+		writeFileSync(CACHE_FILE, JSON.stringify(models, null, 2), "utf-8");
+	} catch {
+		// ignore write failures
+	}
 }
 
 async function discoverModels(bin: string): Promise<DiscoveredModel[]> {
@@ -92,14 +157,7 @@ async function discoverModels(bin: string): Promise<DiscoveredModel[]> {
 	} catch {
 		// fall through to defaults
 	}
-	return [
-		{ id: "auto", name: "Auto", contextWindow: 400_000, reasoning: false },
-		{ id: "composer-1.5", name: "Composer 1.5", contextWindow: 400_000, reasoning: false },
-		{ id: "claude-4.6-opus-max-thinking", name: "Claude Opus 4.6 Thinking", contextWindow: 1_000_000, reasoning: true },
-		{ id: "claude-4.6-sonnet-medium-thinking", name: "Claude Sonnet 4.6 Thinking", contextWindow: 1_000_000, reasoning: true },
-		{ id: "gpt-5.4-high", name: "GPT-5.4 High", contextWindow: 1_000_000, reasoning: true },
-		{ id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", contextWindow: 1_000_000, reasoning: false },
-	];
+	return DEFAULT_MODELS;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,10 +651,7 @@ function streamCursorBridge(
 // Extension entry
 // ---------------------------------------------------------------------------
 
-export default async function (pi: ExtensionAPI) {
-	const bin = resolveBin();
-	const discovered = await discoverModels(bin);
-
+function registerCursorProvider(pi: ExtensionAPI, models: DiscoveredModel[]) {
 	pi.registerProvider(PROVIDER_ID, {
 		name: "Cursor",
 		api: CURSOR_API_ID,
@@ -605,7 +660,7 @@ export default async function (pi: ExtensionAPI) {
 		// Not actually used (auth comes from your `cursor-agent login`), but the
 		// provider config expects an API key when models are defined.
 		apiKey: "cursor-agent-local-auth",
-		models: discovered.map((m) => ({
+		models: models.map((m) => ({
 			id: m.id,
 			name: m.name,
 			reasoning: m.reasoning,
@@ -616,13 +671,23 @@ export default async function (pi: ExtensionAPI) {
 		})),
 		streamSimple: streamCursorBridge,
 	});
+}
+
+export default function (pi: ExtensionAPI) {
+	const bin = resolveBin();
+	const initialModels = loadCachedModels();
+
+	registerCursorProvider(pi, initialModels);
 
 	pi.registerCommand("cursor-models", {
 		description: "Re-discover available Cursor models via cursor-agent",
 		handler: async (_args, ctx) => {
+			ctx.ui.notify("Discovering Cursor models via cursor-agent...", "info");
 			const models = await discoverModels(bin);
+			saveCachedModels(models);
+			registerCursorProvider(pi, models);
 			ctx.ui.notify(
-				`Found ${models.length} Cursor models:\n${models.map((m) => `  cursor/${m.id} — ${m.name}`).join("\n")}\n\nRun /reload after new models appear.`,
+				`Found and cached ${models.length} Cursor models:\n${models.map((m) => `  cursor/${m.id} — ${m.name}`).join("\n")}`,
 				"info",
 			);
 		},
