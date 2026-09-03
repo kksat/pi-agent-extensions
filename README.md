@@ -8,7 +8,6 @@ A collection of custom [pi](https://pi.dev) packages, each installable separatel
 |---|---|
 | [`packages/cursor`](./packages/cursor) | Use Cursor subscription models via the `cursor-agent` CLI bridge |
 | [`packages/worktree`](./packages/worktree) | Manage git worktrees with tmux-integrated pi agents |
-| [`packages/open-current-folder`](./packages/open-current-folder) | Open the current folder in `$EDITOR` with Ctrl+E |
 | [`packages/terminal`](./packages/terminal) | Embedded PTY terminal pane toggled with Ctrl+/ |
 | [`packages/vim`](./packages/vim) | Full-featured Vim modal editing for the prompt editor |
 
@@ -21,7 +20,7 @@ git clone https://github.com/kksat/pi-agent-extensions.git ~/dev/pi-agent-extens
 
 pi install ~/dev/pi-agent-extensions/packages/cursor
 pi install ~/dev/pi-agent-extensions/packages/worktree
-pi install ~/dev/pi-agent-extensions/packages/open-current-folder
+pi install ~/dev/pi-agent-extensions/packages/terminal
 pi install ~/dev/pi-agent-extensions/packages/vim
 ```
 
