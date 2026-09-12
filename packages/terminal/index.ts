@@ -32,6 +32,7 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  */
 
 import { execPath } from "node:process";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { delimiter, join, sep } from "node:path";
 import { spawn } from "node-pty";
@@ -58,6 +59,45 @@ interface TerminalEntry {
 	name: string;
 	/** Raw byte sequences this key can arrive as (matched in handleInput). */
 	raw: string[];
+	/**
+	 * Execution mode:
+	 * - "overlay": persistent embedded PTY rendered in a Pi overlay pane.
+	 * - "suspend": suspends Pi's TUI and runs directly on the native terminal
+	 *   with full GPU rendering, unhooked stdio, and zero lag. Ideal for
+	 *   interactive editors (nvim/vim) and heavy TUIs (htop/lazygit).
+	 */
+	mode: "overlay" | "suspend";
+}
+
+/** Known interactive commands that benefit from native terminal suspend mode. */
+const INTERACTIVE_COMMANDS = new Set([
+	"nvim",
+	"vim",
+	"vi",
+	"nano",
+	"emacs",
+	"helix",
+	"hx",
+	"micro",
+	"pico",
+	"kak",
+	"lazygit",
+	"gitui",
+	"tig",
+	"ranger",
+	"nnn",
+	"yazi",
+	"lf",
+	"htop",
+	"top",
+	"btop",
+]);
+
+function isInteractiveCommand(command?: string): boolean {
+	if (!command) return false;
+	const firstWord = command.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+	const bin = firstWord.split("/").pop() ?? firstWord;
+	return INTERACTIVE_COMMANDS.has(bin);
 }
 
 /**
@@ -83,7 +123,7 @@ function rawSequencesFor(key: string): string[] {
 /** Load terminal entries from ~/.pi/agent/pi-terminal.json (or defaults). */
 function loadEntries(): TerminalEntry[] {
 	let list:
-		| Array<{ key?: string; command?: string; name?: string }>
+		| Array<{ key?: string; command?: string; name?: string; mode?: "overlay" | "suspend" }>
 		| undefined;
 	try {
 		const configPath = join(homedir(), ".pi", "agent", "pi-terminal.json");
@@ -91,7 +131,7 @@ function loadEntries(): TerminalEntry[] {
 			const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
 			if (Array.isArray(parsed)) list = parsed;
 			else if (parsed && typeof parsed === "object" && Array.isArray((parsed as { terminals?: unknown }).terminals)) {
-				list = (parsed as { terminals: Array<{ key?: string; command?: string; name?: string }> }).terminals;
+				list = (parsed as { terminals: Array<{ key?: string; command?: string; name?: string; mode?: "overlay" | "suspend" }> }).terminals;
 			}
 		}
 	} catch {
@@ -103,6 +143,12 @@ function loadEntries(): TerminalEntry[] {
 	for (const [i, raw] of source.entries()) {
 		if (!raw || typeof raw.key !== "string" || raw.key === "") continue;
 		const label = raw.name ?? raw.command ?? "Terminal";
+		const mode: "overlay" | "suspend" =
+			raw.mode === "suspend" || raw.mode === "overlay"
+				? raw.mode
+				: isInteractiveCommand(raw.command)
+					? "suspend"
+					: "overlay";
 		out.push({
 			id: raw.name ?? raw.command ?? `terminal-${i + 1}`,
 			key: raw.key,
@@ -112,10 +158,11 @@ function loadEntries(): TerminalEntry[] {
 			command: typeof raw.command === "string" && raw.command !== "" ? raw.command : undefined,
 			name: label,
 			raw: rawSequencesFor(raw.key),
+			mode,
 		});
 	}
 	if (out.length === 0) {
-		out.push({ id: "default", key: "ctrl+/", aliases: ["ctrl+_"], name: "Terminal", raw: ["\x1f"] });
+		out.push({ id: "default", key: "ctrl+/", aliases: ["ctrl+_"], name: "Terminal", raw: ["\x1f"], mode: "overlay" });
 	}
 	return out;
 }
@@ -589,10 +636,55 @@ function hideTerminal(s: TerminalSession, ctx: ExtensionContext): void {
 	ctx.ui.notify(`${s.entry.name} hidden (${s.entry.key} to show)`, "info");
 }
 
+/**
+ * Run a command in suspend mode: temporarily pauses Pi's TUI and runs the
+ * command directly on the host terminal with full interactive stdio.
+ *
+ * This provides 100% native performance (zero V8 string allocation overhead,
+ * no overlay compositing, GPU acceleration, native cursor and mouse handling).
+ * Ideal for nvim/vim and heavy TUIs.
+ */
+async function runSuspendTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
+	if (!entry.command) return;
+
+	await ctx.ui.custom<number | null>((tui, _theme, _keybindings, done) => {
+		// 1. Stop Pi's TUI to release the terminal
+		tui.stop();
+
+		// 2. Clear screen, home cursor, and explicitly enable the hardware cursor
+		process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
+
+		let exitCode: number | null = 0;
+		try {
+			const shell = process.env.SHELL || "/bin/sh";
+			const result = spawnSync(shell, ["-c", entry.command!], {
+				cwd: ctx.cwd,
+				stdio: "inherit",
+				env: process.env,
+			});
+			exitCode = result.status;
+		} catch {
+			exitCode = 1;
+		} finally {
+			// 3. Restart Pi's TUI and force a full screen refresh
+			tui.start();
+			tui.requestRender(true);
+		}
+
+		done(exitCode);
+		return { render: () => [], invalidate: () => {} };
+	});
+}
+
 export default function (pi: ExtensionAPI) {
 	async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify("Terminal requires interactive mode", "error");
+			return;
+		}
+
+		if (entry.mode === "suspend") {
+			await runSuspendTerminal(ctx, entry);
 			return;
 		}
 
@@ -620,7 +712,9 @@ export default function (pi: ExtensionAPI) {
 	for (const entry of entries) {
 		entryHandlers.set(entry.id, (ctx) => handler(ctx, entry));
 		const description = entry.command
-			? `${entry.name} terminal (${entry.command})`
+			? entry.mode === "suspend"
+				? `Open ${entry.name} (${entry.command}) in native terminal`
+				: `${entry.name} terminal (${entry.command})`
 			: `Toggle embedded ${entry.name.toLowerCase()} terminal`;
 		for (const key of [entry.key, ...entry.aliases]) {
 			pi.registerShortcut(asKeyId(key), { description, handler: (ctx) => handler(ctx, entry) });

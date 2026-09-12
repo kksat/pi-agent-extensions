@@ -41,13 +41,14 @@ TUI session. Uses `$SHELL` (falls back to `/bin/zsh`).
 ### Configuring terminals
 
 Create `~/.pi/agent/pi-terminal.json` to define any number of independent
-terminals. Each entry gets its own persistent PTY:
+terminals.
 
 ```json
 {
   "terminals": [
-    { "key": "ctrl+/" },
-    { "key": "alt+e", "command": "nvim", "name": "editor" }
+    { "key": "alt+t" },
+    { "key": "alt+e", "command": "nvim", "name": "editor" },
+    { "key": "alt+g", "command": "lazygit", "name": "git" }
   ]
 }
 ```
@@ -57,6 +58,12 @@ terminals. Each entry gets its own persistent PTY:
 | `key` | Hotkey that opens/shows the terminal (required) |
 | `command` | Optional command run inside the terminal when it is first created |
 | `name` | Optional label used in notifications (defaults to `command` or `Terminal`) |
+| `mode` | `"overlay"` (embedded floating pane) or `"suspend"` (pauses Pi for 100% native terminal performance). Defaults to `"suspend"` for interactive editors (`nvim`, `vim`, `nano`, `emacs`, `helix`, etc.) and TUIs (`htop`, `lazygit`, etc.), and `"overlay"` for general shells or background servers. |
+
+### Modes: Overlay vs. Suspend
+
+- **`overlay` mode (default for shells):** Runs in a persistent background PTY inside Pi's TUI. The terminal keeps running while hidden. Ideal for shell sessions, running build watchers, or services.
+- **`suspend` mode (default for editors):** Temporarily pauses Pi's TUI and hands stdin/stdout directly to the process. When you exit (e.g. `:wq` or `:q` in Neovim), you return immediately to Pi. This bypasses all virtual terminal emulation and DOM/TUI compositing overhead, giving 100% native GPU rendering, full tree-sitter/LSP performance, native mouse support, and zero input latency regardless of how long the Pi session has been running.
 
 Restart pi (or run `/reload`) after editing the config. If the config file is
 missing or malformed, only the default **Ctrl+/** terminal is provided.
