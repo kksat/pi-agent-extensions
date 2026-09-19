@@ -1,7 +1,8 @@
 // Vendored from Firstmate (https://github.com/kunchenguid/firstmate) at commit
 // 2bcb88c38921030033a37d67ae4f5d82cea90eb4, .pi/extensions/fm-calm.ts.
 // Local changes: the Calm preference defaults to ~/.pi/agent/calm instead of a
-// Firstmate home, and the operational-input helper lives in ./bin.
+// Firstmate home, the operational-input helper lives in ./bin, and the working
+// presentation picks one of 20 scenes at random per run (see lib/fm-calm-animations.ts).
 //
 // Firstmate's home-persistent Pi transcript presentation toggle.
 //
@@ -135,10 +136,10 @@ export default function (pi: ExtensionAPI) {
   // continuations, retries, or compaction that stay inside the same run.
   let agentRunActive = false;
   let workingShipShown = false;
-  // One animation instance per extension lifetime. Hiding the working widget freezes
-  // this state; the next working period resumes it. session_start resets it so a fresh
-  // Pi session starts at the normal initial position. Never module-global.
-  const workingShipAnimation = createCalmWorkingShipAnimation();
+  // One animation instance per working period. Hiding the working widget freezes this
+  // state; the next working period resumes it. A fresh period re-rolls the scene, so
+  // every agent run gets a different animation. Never module-global.
+  let workingShipAnimation = createCalmWorkingShipAnimation();
 
   // Single owner of Calm's working-row presentation choice. The widget is only created
   // or removed on a real transition, so repeated starts cannot duplicate its timer.
@@ -149,11 +150,14 @@ export default function (pi: ExtensionAPI) {
     const showShip = agentRunActive && calmPresentationIsActive();
     if (showShip !== workingShipShown) {
       workingShipShown = showShip;
+      if (showShip) {
+        // Re-roll the scene for every working period so each run gets a fresh one.
+        workingShipAnimation = createCalmWorkingShipAnimation();
+      }
+      const animation = workingShipAnimation;
       ui.setWidget(
         CALM_WORKING_SHIP_WIDGET_KEY,
-        showShip
-          ? (tui) => createCalmWorkingShipWidget(tui, workingShipAnimation)
-          : undefined,
+        showShip ? (tui) => createCalmWorkingShipWidget(tui, animation) : undefined,
       );
       ui.setWorkingVisible(!showShip);
     } else if (forceStockVisibility && !showShip) {
@@ -427,7 +431,7 @@ export default function (pi: ExtensionAPI) {
     publishPresentationState();
     agentRunActive = false;
     workingShipShown = false;
-    // A genuine new session lifetime starts the boat at the normal initial position.
+    // A fresh session starts from a fresh scene; the next working period re-rolls it.
     workingShipAnimation.reset();
     applyWorkingPresentation(ctx.ui, true);
     ctx.ui.setHiddenThinkingLabel(calmPresentationIsActive() ? "" : undefined);

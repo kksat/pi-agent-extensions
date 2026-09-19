@@ -10,10 +10,37 @@ Nothing is deleted. Hidden content stays in the message, the model context, sess
 
 - **Conversation-only transcript.** Collapsed thinking labels, short mid-turn assistant working notes, and the shells of the built-in tool rows Calm owns are hidden from the live view.
 - **Substantive text is preserved.** A mid-turn assistant text block is hidden only when it has no newline and its trimmed length is under 240 characters. A newline or ≥240 trimmed characters keeps it visible. Streaming text and the final reply always stay visible.
-- **Animated working boat.** While a run is active, the stock working row is replaced by a two-row sailboat: a `◿│◣` sail over a `╲▁▁▁╱` hull, in standard ANSI blue water and yellow boat. The boat moves one column every 880 ms while the wave advances every 220 ms. It reflows on resize, disappears when the run settles, aborts, or fails, and resumes from its last position on the next run within the same session.
+- **Animated working scene.** While a run is active, the stock working row is replaced by one of 20 small animated scenes, chosen at random for every run. The original sailboat is one of them; the rest include a fish, duck, clouds, stars, moon, rain, snow, bouncing ball, pendulum, spinner, progress bar, pulse, wave, rocket, balloon, butterfly, cat, coffee, and windmill. Scenes reflow on resize, disappear when the run settles, aborts, or fails, and resume from their last frame on the next run within the same session.
 - **Operational input rows.** User rows recognized by the bundled Firstmate operational-input parser (session-start, watcher, turn-end guard, away-supervisor, launch-brief, branch-outcome, from-firstmate) render at zero height. Every other user row stays visible.
 - **Export stays complete.** `/export` and `/share` temporarily render stock rows so exported artifacts contain everything.
 - **Persistent preference.** The last `/calm` choice is stored in `~/.pi/agent/calm` and restored on the next start.
+
+## Working scenes
+
+Each agent run picks one scene at random. All scenes share a 220 ms tick and paint only single-column glyphs in a fixed ANSI palette, so they never depend on the active theme.
+
+| Scene | Description |
+|---|---|
+| `sailboat` | The original Firstmate sailboat on a rolling swell |
+| `fish` | A fish swimming across with a wiggling tail |
+| `duck` | A duck paddling along a water line |
+| `clouds` | Two clouds drifting at different speeds |
+| `stars` | A twinkling starfield |
+| `moon` | A moon cycling through its phases |
+| `rain` | Falling raindrops |
+| `snow` | Drifting snowflakes |
+| `ball` | A ball bouncing along the ground |
+| `pendulum` | A pendulum swinging from a pivot |
+| `spinner` | A braille spinner |
+| `progress` | An indeterminate progress bar |
+| `pulse` | A pulsing dot |
+| `wave` | A travelling sine wave |
+| `rocket` | A rocket flying with a flickering flame |
+| `balloon` | A balloon floating across |
+| `butterfly` | A butterfly flapping its wings |
+| `cat` | A walking cat with a swishing tail |
+| `coffee` | A steaming cup |
+| `windmill` | A rotating windmill |
 
 ## Commands
 
@@ -48,6 +75,14 @@ Calm probes the exact pi API seams it patches (collapsed-thinking layout, operat
 
 Calm's built-in tool presentation shares pi's single, unmerged override slot per tool name with any other extension that overrides the same tool. While Calm is off it registers none of them. The first time Calm turns on in a session that started off, it claims every built-in name no other extension already owns and warns about the ones it skipped.
 
+## Tests
+
+The animation catalogue has a self-running check:
+
+```bash
+node --experimental-strip-types packages/calm/test.ts
+```
+
 ## Provenance
 
-Vendored from [Firstmate](https://github.com/kunchenguid/firstmate) at commit `2bcb88c38921030033a37d67ae4f5d82cea90eb4` (`.pi/extensions/fm-calm.ts` and its `lib/` dependencies). Firstmate is MIT licensed; see [`LICENSE.firstmate`](./LICENSE.firstmate). Local changes: the Calm preference defaults to `~/.pi/agent/calm` instead of a Firstmate home, and the operational-input helper lives in `./bin`.
+Vendored from [Firstmate](https://github.com/kunchenguid/firstmate) at commit `2bcb88c38921030033a37d67ae4f5d82cea90eb4` (`.pi/extensions/fm-calm.ts` and its `lib/` dependencies). Firstmate is MIT licensed; see [`LICENSE.firstmate`](./LICENSE.firstmate). Local changes: the Calm preference defaults to `~/.pi/agent/calm` instead of a Firstmate home, the operational-input helper lives in `./bin`, and `lib/fm-calm-animations.ts` adds the 20-scene working-animation catalogue (the original sailboat is kept as one scene).
