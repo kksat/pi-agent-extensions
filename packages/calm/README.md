@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) extension that adds **Calm mode**: a conversation-only transcript presentation, toggled with `/calm`.
 
-While Calm is on, pi's transcript shows only the genuine conversation — your prompts, the agent's real replies, and the working status — and hides the noise in between: collapsed thinking, short mid-turn "working note" narration, and the shells of the built-in tool rows (`bash`, `read`, `edit`, `write`, `grep`, `find`, `ls`). While an agent run is under way, the stock `Working...` row is replaced by a small animated sailboat.
+While Calm is on, pi's transcript shows only the genuine conversation — your prompts, the agent's real replies, and the working status — and hides the noise in between: collapsed thinking, short mid-turn "working note" narration, and the shells of the built-in tool rows (`bash`, `read`, `edit`, `write`, `grep`, `find`, `ls`). While an agent run is under way, the stock `Working...` row is replaced by one of 20 small animated scenes.
 
 Nothing is deleted. Hidden content stays in the message, the model context, session storage, and `/export` artifacts — Calm changes presentation only.
 
@@ -61,14 +61,6 @@ Or from npm, if published:
 pi install npm:pi-extension-calm
 ```
 
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `FM_CONFIG_OVERRIDE` | Directory holding the `calm` preference file (default: `~/.pi/agent`) |
-| `FM_HOME` / `FM_ROOT_OVERRIDE` | Firstmate home; when set, the preference file lives in `<home>/config/calm` |
-| `FM_OPERATIONAL_INPUT_SCRIPT` | Path to the operational-input parser (default: bundled `./bin/fm-operational-input.sh`) |
-
 ## Compatibility
 
 Calm probes the exact pi API seams it patches (collapsed-thinking layout, operational-user rows) and degrades one adapter at a time with a console diagnostic if a future pi removes a seam — `/calm` and the rest of the extension keep working.
@@ -85,4 +77,4 @@ node --experimental-strip-types packages/calm/test.ts
 
 ## Provenance
 
-Vendored from [Firstmate](https://github.com/kunchenguid/firstmate) at commit `2bcb88c38921030033a37d67ae4f5d82cea90eb4` (`.pi/extensions/fm-calm.ts` and its `lib/` dependencies). Firstmate is MIT licensed; see [`LICENSE.firstmate`](./LICENSE.firstmate). Local changes: the Calm preference defaults to `~/.pi/agent/calm` instead of a Firstmate home, the operational-input helper lives in `./bin`, and `lib/fm-calm-animations.ts` adds the 20-scene working-animation catalogue (the original sailboat is kept as one scene).
+Vendored from [Firstmate](https://github.com/kunchenguid/firstmate) at commit `2bcb88c38921030033a37d67ae4f5d82cea90eb4` (`.pi/extensions/fm-calm.ts` and its `lib/` dependencies). Firstmate is MIT licensed; see [`LICENSE.firstmate`](./LICENSE.firstmate). Local changes: the Calm preference is fixed at `~/.pi/agent/calm`, the operational-input helper is fixed at the bundled `./bin/fm-operational-input.sh`, and `lib/fm-calm-animations.ts` adds the 20-scene working-animation catalogue (the original sailboat is kept as one scene).

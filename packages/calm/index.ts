@@ -1,8 +1,8 @@
 // Vendored from Firstmate (https://github.com/kunchenguid/firstmate) at commit
 // 2bcb88c38921030033a37d67ae4f5d82cea90eb4, .pi/extensions/fm-calm.ts.
-// Local changes: the Calm preference defaults to ~/.pi/agent/calm instead of a
-// Firstmate home, the operational-input helper lives in ./bin, and the working
-// presentation picks one of 20 scenes at random per run (see lib/fm-calm-animations.ts).
+// Local changes: the Calm preference is fixed at ~/.pi/agent/calm, the operational-input
+// helper is fixed at the bundled ./bin script, and the working presentation picks one of
+// 20 scenes at random per run (see lib/fm-calm-animations.ts).
 //
 // Firstmate's home-persistent Pi transcript presentation toggle.
 //
@@ -165,14 +165,8 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  // Standalone package: default the Calm preference to the user's pi agent directory
-  // instead of a Firstmate home. FM_HOME / FM_ROOT_OVERRIDE / FM_CONFIG_OVERRIDE still
-  // win when set, so a Firstmate checkout keeps its existing config location.
-  const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE;
-  const configDirectory =
-    process.env.FM_CONFIG_OVERRIDE ||
-    (fmHome ? resolve(fmHome, "config") : resolve(homedir(), ".pi", "agent"));
-  const calmPreferencePath = resolve(configDirectory, "calm");
+  // Standalone package: the Calm preference lives in the user's pi agent directory.
+  const calmPreferencePath = resolve(homedir(), ".pi", "agent", "calm");
   // "max" is the legacy value written by the removed third presentation level, whose
   // behavior is now ordinary Calm; a home upgraded from it restores as on rather than
   // dropping to off. docs/configuration.md owns the persisted value schema.
