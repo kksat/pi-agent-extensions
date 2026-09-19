@@ -251,18 +251,22 @@ const clouds = defineAnimation("clouds", {
     state.offset += 1;
   },
   paint: (state, width) => {
-    const x1 = (state.offset % Math.max(1, width + 8)) - 8;
-    const x2 = ((state.offset * 2 + 20) % Math.max(1, width + 10)) - 10;
-    return [
-      paintRow(width, [
-        { at: x1, text: ".-.", color: "bright" },
-        { at: x2, text: ".-.", color: "dim" },
-      ]),
-      paintRow(width, [
-        { at: x1, text: "(   )", color: "bright" },
-        { at: x2, text: "(   )", color: "dim" },
-      ]),
-    ];
+    const cloudWidth = 5;
+    const period = Math.max(1, width + cloudWidth);
+    const top: Placement[] = [];
+    const bottom: Placement[] = [];
+    // Draw each cloud twice, one period apart, so it re-enters from the left as it
+    // leaves the right instead of blinking out at the wrap. The `.-.` cap sits one
+    // column in, centered over the `(   )` body.
+    const draw = (base: number, color: CalmAnimationColor) => {
+      for (const x of [base, base - period]) {
+        top.push({ at: x + 1, text: ".-.", color });
+        bottom.push({ at: x, text: "(   )", color });
+      }
+    };
+    draw(state.offset % period, "bright");
+    draw((state.offset + Math.floor(period / 2)) % period, "dim");
+    return [paintRow(width, top), paintRow(width, bottom)];
   },
 });
 
