@@ -1,0 +1,29 @@
+{
+	"name": "pi-extension-tool-call-recovery",
+	"version": "0.1.0",
+	"description": "pi extension: recover pseudo-JSON tool fences that Grok and OpenAI-compatible proxies leak into the assistant text stream",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"tool-call",
+		"grok",
+		"xai",
+		"openai-compatible",
+		"recovery"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/tool-call-recovery"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}
