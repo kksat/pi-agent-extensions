@@ -74,6 +74,21 @@ interface DiscoveredModel {
 	reasoning: boolean;
 }
 
+// Models the cursor-agent CLI accepts but does not advertise in
+// `cursor-agent models` (e.g. shipped in the Cursor IDE first). Merged into
+// both the defaults and every discovery result so `/cursor-models` keeps them.
+const EXTRA_MODELS: DiscoveredModel[] = [
+	{ id: "grok-4.7-low", name: "Grok 4.7 Low", contextWindow: 400_000, reasoning: false },
+	{ id: "grok-4.7-medium", name: "Grok 4.7 Medium", contextWindow: 400_000, reasoning: false },
+	{ id: "grok-4.7-high", name: "Grok 4.7", contextWindow: 400_000, reasoning: false },
+	{ id: "grok-4.7-xhigh", name: "Grok 4.7 Extra High", contextWindow: 400_000, reasoning: false },
+];
+
+function withExtras(models: DiscoveredModel[]): DiscoveredModel[] {
+	const seen = new Set(models.map((m) => m.id));
+	return [...models, ...EXTRA_MODELS.filter((m) => !seen.has(m.id))];
+}
+
 const DEFAULT_MODELS: DiscoveredModel[] = [
 	{ id: "auto", name: "Auto", contextWindow: 400_000, reasoning: false },
 	{ id: "composer-2.5", name: "Composer 2.5", contextWindow: 400_000, reasoning: false },
@@ -109,6 +124,7 @@ const DEFAULT_MODELS: DiscoveredModel[] = [
 	{ id: "claude-4-sonnet-thinking", name: "Claude Sonnet 4 Thinking", contextWindow: 400_000, reasoning: true },
 	{ id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", contextWindow: 1_000_000, reasoning: false },
 	{ id: "gemini-3-flash", name: "Gemini 3 Flash", contextWindow: 1_000_000, reasoning: false },
+	...EXTRA_MODELS,
 ];
 
 function loadCachedModels(): DiscoveredModel[] {
@@ -116,7 +132,7 @@ function loadCachedModels(): DiscoveredModel[] {
 		try {
 			const data = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
 			if (Array.isArray(data) && data.length > 0) {
-				return data;
+				return withExtras(data);
 			}
 		} catch {
 			// fall through to defaults
@@ -153,7 +169,7 @@ async function discoverModels(bin: string): Promise<DiscoveredModel[]> {
 				reasoning: /thinking|reasoning/i.test(id),
 			});
 		}
-		if (models.length > 0) return models;
+		if (models.length > 0) return withExtras(models);
 	} catch {
 		// fall through to defaults
 	}
