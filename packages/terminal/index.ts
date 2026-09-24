@@ -47,7 +47,7 @@ import type { IPty } from "node-pty";
 import { Terminal } from "@xterm/headless";
 import type { IBufferCell } from "@xterm/headless";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, matchesKey } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { KeyId, TUI } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 
@@ -450,6 +450,7 @@ function asKeyId(key: string): KeyId {
 const entries = loadEntries();
 
 function matchEntry(data: string): TerminalEntry | null {
+	if (isKeyRelease(data)) return null;
 	for (const entry of entries) {
 		if (entry.raw.includes(data)) return entry;
 		if (matchesKey(data, asKeyId(entry.key))) return entry;
@@ -459,6 +460,7 @@ function matchEntry(data: string): TerminalEntry | null {
 }
 
 function isDetachKey(data: string, entry: TerminalEntry): boolean {
+	if (isKeyRelease(data)) return false;
 	if (matchesKey(data, asKeyId(entry.key))) return true;
 	if (entry.aliases.some((alias) => matchesKey(data, asKeyId(alias)))) return true;
 	if (entry.raw.includes(data)) return true;
@@ -817,6 +819,9 @@ async function attachOverlayUI(ctx: ExtensionContext, s: OverlaySession): Promis
 				},
 
 				handleInput(data: string): void {
+					if (isKeyRelease(data)) {
+						return;
+					}
 					const hit = matchEntry(data);
 					if (hit) {
 						if (hit.id === s.entry.id) {
@@ -996,11 +1001,25 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			process.stdout.write(data);
 		});
 
+		const attachedAt = Date.now();
+		const COOLDOWN_MS = 350;
+
 		const stdinHandler = (chunk: Buffer | string) => {
 			const str = typeof chunk === "string" ? chunk : chunk.toString("utf8");
 
+			// Discard key release events (especially from Kitty keyboard protocol)
+			if (isKeyRelease(str)) {
+				return;
+			}
+
+			const isInitialCooldown = Date.now() - attachedAt < COOLDOWN_MS;
+
 			const hit = matchEntry(str);
 			if (hit) {
+				if (isInitialCooldown) {
+					// Swallowed initial hotkey release / repeat from launching
+					return;
+				}
 				if (hit.id === entry.id) {
 					cleanup(true);
 				} else {
@@ -1013,12 +1032,21 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			}
 
 			if (isDetachKey(str, entry)) {
+				if (isInitialCooldown) {
+					// Swallowed initial hotkey release / repeat from launching
+					return;
+				}
 				cleanup(true);
 				return;
 			}
 
 			session!.pty.write(str);
 		};
+
+		// Flush any pending data in stdin buffer before attaching listener
+		try {
+			while (process.stdin.read() !== null) {}
+		} catch {}
 
 		if (process.stdin.isTTY) {
 			process.stdin.setRawMode(true);
