@@ -104,6 +104,7 @@ export interface OverlaySession {
 
 export interface PassthroughSession {
 	entry: TerminalEntry;
+	term: Terminal;
 	pty: IPty;
 	pid: number;
 	paused: boolean;
@@ -247,18 +248,12 @@ async function killAllSessionsGraceful(): Promise<void> {
 		ps.detachResolver = null;
 		promises.push(
 			(async () => {
-				if (ps.paused) {
-					try {
-						process.kill(-ps.pid, "SIGCONT");
-					} catch {
-						try {
-							process.kill(ps.pid, "SIGCONT");
-						} catch {}
-					}
-				}
 				await killProcessTreeGraceful(ps.pid);
 				try {
 					ps.pty.kill();
+				} catch {}
+				try {
+					ps.term.dispose();
 				} catch {}
 			})(),
 		);
@@ -276,15 +271,6 @@ function killAllSessionsSync(): void {
 		} catch {}
 	}
 	for (const ps of globalState.passthroughSessions.values()) {
-		if (ps.paused) {
-			try {
-				process.kill(-ps.pid, "SIGCONT");
-			} catch {
-				try {
-					process.kill(ps.pid, "SIGCONT");
-				} catch {}
-			}
-		}
 		killProcessTreeSync(ps.pid);
 		try {
 			ps.pty.kill();
@@ -894,12 +880,20 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
 		tui.stop();
 
+		const cols = process.stdout.columns || 120;
+		const rows = process.stdout.rows || 24;
 		const isNewSession = !session;
+
 		if (isNewSession) {
 			ensureSpawnHelperExecutable();
 			const shell = process.env.SHELL || "/bin/zsh";
-			const cols = process.stdout.columns || 120;
-			const rows = process.stdout.rows || 24;
+
+			const term = new Terminal({
+				cols,
+				rows,
+				scrollback: 2000,
+				allowProposedApi: true,
+			});
 
 			const pty = spawn(shell, entry.command ? ["-c", entry.command] : [], {
 				name: "xterm-256color",
@@ -915,6 +909,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 
 			session = {
 				entry,
+				term,
 				pty,
 				pid: pty.pid,
 				paused: false,
@@ -927,6 +922,9 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			pty.onExit(({ exitCode }) => {
 				if (globalState.passthroughSessions.get(entry.id) === session) {
 					globalState.passthroughSessions.delete(entry.id);
+					try {
+						session?.term.dispose();
+					} catch {}
 					updateFooterStatus(ctx);
 					ctx.ui.notify(`${entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
 					session?.detachResolver?.();
@@ -934,57 +932,59 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			});
 		}
 
-		// Attach PTY output to stdout immediately so no initial draw bytes are lost
+		let isAttached = true;
+
+		// Listen to PTY data: always keep virtual terminal buffer updated;
+		// pipe directly to stdout only while attached
 		const dataDisposable = session!.pty.onData((data) => {
-			process.stdout.write(data);
+			session!.term.write(data);
+			if (isAttached) {
+				process.stdout.write(data);
+			}
 		});
 
 		if (!isNewSession && session!.paused) {
-			process.stdout.write("\x1b[?1049h\x1b[?25h");
-			try {
-				process.kill(-session!.pid, "SIGCONT");
-			} catch {
-				try {
-					process.kill(session!.pid, "SIGCONT");
-				} catch {}
-			}
 			session!.paused = false;
 
-			const cols = process.stdout.columns || 120;
-			const rows = process.stdout.rows || 24;
-			try {
-				// Toggle dimensions by 1 row to force kernel TIOCSWINSZ / SIGWINCH
-				session!.pty.resize(cols, rows > 1 ? rows - 1 : rows + 1);
-				session!.pty.resize(cols, rows);
-			} catch {}
-			try {
-				process.kill(-session!.pid, "SIGWINCH");
-			} catch {
+			// Resize PTY and buffer to match current terminal window
+			if (session!.term.cols !== cols || session!.term.rows !== rows) {
 				try {
-					process.kill(session!.pid, "SIGWINCH");
+					session!.pty.resize(cols, rows);
+					session!.term.resize(cols, rows);
 				} catch {}
 			}
-			try {
-				session!.pty.write("\x0c");
-			} catch {}
+
+			// Restore entire screen from virtual terminal buffer in one atomic write
+			const buf = session!.term.buffer.active;
+			const lines: string[] = [];
+			const targetRows = Math.min(rows, buf.length);
+			for (let y = 0; y < targetRows; y++) {
+				lines.push(renderRow(session!.term, y, buf.cursorX, buf.cursorY).replaceAll(CURSOR_MARKER, ""));
+			}
+			process.stdout.write(
+				"\x1b[?1049h\x1b[H" +
+					lines.join("\r\n") +
+					`\x1b[${buf.cursorY + 1};${buf.cursorX + 1}H\x1b[?25h`,
+			);
 		} else {
 			process.stdout.write("\x1b[?25h");
 		}
 
 		const resizeHandler = () => {
-			const cols = process.stdout.columns || 120;
-			const rows = process.stdout.rows || 24;
+			const c = process.stdout.columns || 120;
+			const r = process.stdout.rows || 24;
 			try {
-				session!.pty.resize(cols, rows);
+				session!.pty.resize(c, r);
+				session!.term.resize(c, r);
 			} catch {}
 		};
 		process.stdout.on("resize", resizeHandler);
-		resizeHandler();
 
 		let cleanedUp = false;
 		const cleanup = (shouldPause: boolean) => {
 			if (cleanedUp) return;
 			cleanedUp = true;
+			isAttached = false;
 			session!.detachResolver = null;
 
 			process.stdout.off("resize", resizeHandler);
@@ -1000,13 +1000,6 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 
 			if (shouldPause && globalState.passthroughSessions.get(entry.id) === session) {
 				session!.paused = true;
-				try {
-					process.kill(-session!.pid, "SIGSTOP");
-				} catch {
-					try {
-						process.kill(session!.pid, "SIGSTOP");
-					} catch {}
-				}
 			}
 
 			// Exit alternate screen buffer back to main screen for Pi's TUI
@@ -1188,18 +1181,12 @@ async function killSingleSession(id: string): Promise<boolean> {
 	if (ps) {
 		globalState.passthroughSessions.delete(id);
 		ps.detachResolver?.();
-		if (ps.paused) {
-			try {
-				process.kill(-ps.pid, "SIGCONT");
-			} catch {
-				try {
-					process.kill(ps.pid, "SIGCONT");
-				} catch {}
-			}
-		}
 		await killProcessTreeGraceful(ps.pid);
 		try {
 			ps.pty.kill();
+		} catch {}
+		try {
+			ps.term.dispose();
 		} catch {}
 		return true;
 	}
