@@ -3,36 +3,43 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
 */
 
 /**
- * pi-terminal - embedded terminals inside pi
+ * pi-terminal - embedded and native terminals inside pi
  *
- * Toggle real PTY-backed terminal panes inside pi.
- * - First press: creates the terminal session and shows it (optionally
- *   running a configured command inside it)
- * - Later presses: shows/hides the existing session (state is preserved)
- * - While a terminal has focus, its hotkey hides it and returns to pi;
+ * Toggle real PTY-backed terminal panes and zero-overhead native editors inside pi.
+ * - First press: creates the session and shows it (optionally running a
+ *   configured command inside it)
+ * - Later presses: shows/hides or resumes/suspends the existing session (state is preserved)
+ * - While a terminal has focus, its hotkey hides/suspends it and returns to pi;
  *   a different terminal's hotkey switches straight to that terminal
  *
  * Terminals and their hotkeys are configured in ~/.pi/agent/pi-terminal.json:
  *
  *   {
  *     "terminals": [
- *       { "key": "ctrl+/" },
- *       { "key": "alt+e", "command": "nvim", "name": "editor" }
+ *       { "key": "alt+t", "width": "100%", "height": "100%" },
+ *       { "key": "alt+e", "command": "nvim", "name": "editor", "mode": "passthrough" }
  *     ]
  *   }
  *
- * Each entry gets its own independent terminal session. If no config file
- * exists, a single plain terminal on ctrl+/ is provided.
+ * Modes:
+ * - "passthrough" (default for interactive editors like nvim/vim and heavy TUIs):
+ *   Runs outside Pi's DOM/render tree directly on the host terminal with raw I/O.
+ *   Eliminates 100% of the transcript re-rendering lag in long conversations.
+ *   Pressing alt+e inside the editor suspends it and returns to Pi; pressing alt+e
+ *   in Pi wakes it back up without losing open files, buffers, or undo trees.
+ * - "overlay" (default for general shells):
+ *   Runs in a persistent PTY rendered as a floating overlay pane. Hidden background
+ *   tasks are throttled so they never trigger Pi chat transcript re-renders.
  *
- * The terminals keep running while hidden, so long-running commands keep
- * going. They only die when you quit pi.
- *
- * Limitations: mouse events are not forwarded to programs running inside
- * the panes.
+ * Session Persistence:
+ * - Terminals and editors survive /new, /resume, /fork, and /reload via a global
+ *   state bridge, seamlessly reattaching to the active session.
+ * - Clean teardown on quit: sends SIGHUP to the entire process group (letting editors
+ *   flush buffers cleanly) and escalates to SIGKILL, preventing orphan leaks.
  */
 
 import { execPath } from "node:process";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { delimiter, join, sep } from "node:path";
 import { spawn } from "node-pty";
@@ -41,35 +48,262 @@ import { Terminal } from "@xterm/headless";
 import type { IBufferCell } from "@xterm/headless";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, matchesKey } from "@earendil-works/pi-tui";
-import type { KeyId } from "@earendil-works/pi-tui";
+import type { KeyId, TUI } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Configuration & Types
 // ---------------------------------------------------------------------------
 
-interface TerminalEntry {
+export interface TerminalEntry {
 	id: string;
 	key: string;
-	/** Legacy aliases registered alongside the main key (see below). */
+	/** Legacy aliases registered alongside the main key. */
 	aliases: string[];
 	/** Optional command run inside the terminal when it is first created. */
 	command?: string;
-	/** Human-readable label for notifications. */
+	/** Human-readable label for notifications and status. */
 	name: string;
 	/** Raw byte sequences this key can arrive as (matched in handleInput). */
 	raw: string[];
 	/**
 	 * Execution mode:
 	 * - "overlay": persistent embedded PTY rendered in a Pi overlay pane.
-	 * - "suspend": suspends Pi's TUI and runs directly on the native terminal
-	 *   with full GPU rendering, unhooked stdio, and zero lag. Ideal for
-	 *   interactive editors (nvim/vim) and heavy TUIs (htop/lazygit).
+	 * - "passthrough": runs directly on native terminal with raw I/O and zero lag.
+	 *   Pressing the hotkey suspends it back to Pi; pressing it in Pi resumes it.
 	 */
-	mode: "overlay" | "suspend";
+	mode: "overlay" | "passthrough";
+	/** Overlay width percentage or cell count (defaults to "100%"). */
+	width: string;
+	/** Overlay height percentage or cell count (defaults to "100%"). */
+	height: string;
 }
 
-/** Known interactive commands that benefit from native terminal suspend mode. */
+interface OverlayHandleLike {
+	focus(): void;
+	unfocus(options?: { target?: unknown | null }): void;
+	setHidden(hidden: boolean): void;
+	hide(): void;
+}
+
+export interface OverlaySession {
+	entry: TerminalEntry;
+	term: Terminal;
+	pty: IPty;
+	pid: number;
+	handle: OverlayHandleLike | null;
+	done: (() => void) | null;
+	visible: boolean;
+	cols: number;
+	rows: number;
+	tui: TUI | null;
+	prevShowHardwareCursor: boolean;
+	startedAt: number;
+	ptyDataDisposable?: { dispose(): void };
+}
+
+export interface PassthroughSession {
+	entry: TerminalEntry;
+	pty: IPty;
+	pid: number;
+	paused: boolean;
+	cwd: string;
+	startedAt: number;
+	detachResolver: (() => void) | null;
+}
+
+interface GlobalTerminalState {
+	overlaySessions: Map<string, OverlaySession>;
+	passthroughSessions: Map<string, PassthroughSession>;
+	exitHookInstalled: boolean;
+}
+
+declare global {
+	// eslint-disable-next-line no-var
+	var __PI_TERMINAL_STATE__: GlobalTerminalState | undefined;
+}
+
+const globalState: GlobalTerminalState = (globalThis.__PI_TERMINAL_STATE__ ??= {
+	overlaySessions: new Map(),
+	passthroughSessions: new Map(),
+	exitHookInstalled: false,
+});
+
+// ---------------------------------------------------------------------------
+// Process Tree & Signal Hygiene
+// ---------------------------------------------------------------------------
+
+/** Get all recursive child process IDs of a given parent PID. */
+function getChildPids(parentPid: number): number[] {
+	try {
+		const out = execFileSync("pgrep", ["-P", String(parentPid)], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const pids = out
+			.trim()
+			.split(/\s+/)
+			.map(Number)
+			.filter((n) => !Number.isNaN(n) && n > 0);
+		const all: number[] = [...pids];
+		for (const pid of pids) {
+			all.push(...getChildPids(pid));
+		}
+		return all;
+	} catch {
+		return [];
+	}
+}
+
+/** Get the foreground command name running under a given PID tree. */
+function getForegroundProcess(pid: number): string | null {
+	try {
+		const children = getChildPids(pid);
+		const targetPid = children.length > 0 ? children[children.length - 1]! : pid;
+		const out = execFileSync("ps", ["-o", "comm=", "-p", String(targetPid)], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return out.split("/").pop() || out || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Gracefully kill a process group and all its descendant processes with escalation. */
+async function killProcessTreeGraceful(pid: number): Promise<void> {
+	const childPids = getChildPids(pid);
+
+	// 1. Send SIGHUP to process group and individual descendants
+	try {
+		process.kill(-pid, "SIGHUP");
+	} catch {
+		try {
+			process.kill(pid, "SIGHUP");
+		} catch {}
+	}
+	for (const cPid of childPids) {
+		try {
+			process.kill(cPid, "SIGHUP");
+		} catch {}
+	}
+
+	// 2. Allow brief grace period for editors/programs to flush buffers & clean up
+	await new Promise((r) => setTimeout(r, 300));
+
+	// 3. Escalate to SIGKILL for any remaining processes
+	const remaining = getChildPids(pid);
+	const toKill = [pid, ...remaining];
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {}
+	for (const p of toKill) {
+		try {
+			process.kill(p, "SIGKILL");
+		} catch {}
+	}
+}
+
+/** Synchronous hard kill for process.on("exit") emergency cleanup. */
+function killProcessTreeSync(pid: number): void {
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {}
+	}
+	for (const cPid of getChildPids(pid)) {
+		try {
+			process.kill(cPid, "SIGKILL");
+		} catch {}
+	}
+}
+
+/** Kill all active sessions across both overlay and passthrough pools gracefully. */
+async function killAllSessionsGraceful(): Promise<void> {
+	const promises: Promise<void>[] = [];
+
+	for (const s of globalState.overlaySessions.values()) {
+		s.ptyDataDisposable?.dispose();
+		s.ptyDataDisposable = undefined;
+		s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
+		s.done = null;
+		s.handle = null;
+		promises.push(
+			(async () => {
+				await killProcessTreeGraceful(s.pid);
+				try {
+					s.pty.kill();
+				} catch {}
+				try {
+					s.term.dispose();
+				} catch {}
+			})(),
+		);
+	}
+
+	for (const ps of globalState.passthroughSessions.values()) {
+		ps.detachResolver = null;
+		promises.push(
+			(async () => {
+				if (ps.paused) {
+					try {
+						process.kill(-ps.pid, "SIGCONT");
+					} catch {
+						try {
+							process.kill(ps.pid, "SIGCONT");
+						} catch {}
+					}
+				}
+				await killProcessTreeGraceful(ps.pid);
+				try {
+					ps.pty.kill();
+				} catch {}
+			})(),
+		);
+	}
+
+	await Promise.allSettled(promises);
+}
+
+/** Kill all sessions synchronously on process exit. */
+function killAllSessionsSync(): void {
+	for (const s of globalState.overlaySessions.values()) {
+		killProcessTreeSync(s.pid);
+		try {
+			s.pty.kill();
+		} catch {}
+	}
+	for (const ps of globalState.passthroughSessions.values()) {
+		if (ps.paused) {
+			try {
+				process.kill(-ps.pid, "SIGCONT");
+			} catch {
+				try {
+					process.kill(ps.pid, "SIGCONT");
+				} catch {}
+			}
+		}
+		killProcessTreeSync(ps.pid);
+		try {
+			ps.pty.kill();
+		} catch {}
+	}
+}
+
+if (!globalState.exitHookInstalled) {
+	globalState.exitHookInstalled = true;
+	process.once("exit", () => {
+		killAllSessionsSync();
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Configuration Loading
+// ---------------------------------------------------------------------------
+
+/** Known interactive commands that benefit from native terminal passthrough mode. */
 const INTERACTIVE_COMMANDS = new Set([
 	"nvim",
 	"vim",
@@ -100,11 +334,22 @@ function isInteractiveCommand(command?: string): boolean {
 	return INTERACTIVE_COMMANDS.has(bin);
 }
 
-/**
- * Raw byte sequences a key binding can arrive as on non-Kitty terminals.
- * Only simple ctrl/alt + single-letter combos are covered; everything else
- * relies on matchesKey() alone.
- */
+function parseDimension(dim: string | undefined, total: number, fallback: number): number {
+	if (!dim) return fallback;
+	const trimmed = dim.trim();
+	if (trimmed.endsWith("%")) {
+		const pct = Number.parseFloat(trimmed) / 100;
+		if (!Number.isNaN(pct) && pct > 0 && pct <= 1) {
+			return Math.max(4, Math.floor(total * pct));
+		}
+	}
+	const num = Number.parseInt(trimmed, 10);
+	if (!Number.isNaN(num) && num > 0) {
+		return Math.min(total, Math.max(4, num));
+	}
+	return fallback;
+}
+
 function rawSequencesFor(key: string): string[] {
 	const parts = key.split("+");
 	const base = parts[parts.length - 1];
@@ -120,18 +365,36 @@ function rawSequencesFor(key: string): string[] {
 	return out;
 }
 
-/** Load terminal entries from ~/.pi/agent/pi-terminal.json (or defaults). */
 function loadEntries(): TerminalEntry[] {
 	let list:
-		| Array<{ key?: string; command?: string; name?: string; mode?: "overlay" | "suspend" }>
+		| Array<{
+				key?: string;
+				command?: string;
+				name?: string;
+				mode?: "overlay" | "passthrough" | "suspend";
+				width?: string;
+				height?: string;
+		  }>
 		| undefined;
+
 	try {
 		const configPath = join(homedir(), ".pi", "agent", "pi-terminal.json");
 		if (existsSync(configPath)) {
 			const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
 			if (Array.isArray(parsed)) list = parsed;
 			else if (parsed && typeof parsed === "object" && Array.isArray((parsed as { terminals?: unknown }).terminals)) {
-				list = (parsed as { terminals: Array<{ key?: string; command?: string; name?: string; mode?: "overlay" | "suspend" }> }).terminals;
+				list = (
+					parsed as {
+						terminals: Array<{
+							key?: string;
+							command?: string;
+							name?: string;
+							mode?: "overlay" | "passthrough" | "suspend";
+							width?: string;
+							height?: string;
+						}>;
+					}
+				).terminals;
 			}
 		}
 	} catch {
@@ -143,41 +406,49 @@ function loadEntries(): TerminalEntry[] {
 	for (const [i, raw] of source.entries()) {
 		if (!raw || typeof raw.key !== "string" || raw.key === "") continue;
 		const label = raw.name ?? raw.command ?? "Terminal";
-		const mode: "overlay" | "suspend" =
-			raw.mode === "suspend" || raw.mode === "overlay"
-				? raw.mode
-				: isInteractiveCommand(raw.command)
-					? "suspend"
-					: "overlay";
+		const rawMode = raw.mode?.toLowerCase();
+		const mode: "overlay" | "passthrough" =
+			rawMode === "passthrough" || rawMode === "suspend"
+				? "passthrough"
+				: rawMode === "overlay"
+					? "overlay"
+					: isInteractiveCommand(raw.command)
+						? "passthrough"
+						: "overlay";
+
 		out.push({
 			id: raw.name ?? raw.command ?? `terminal-${i + 1}`,
 			key: raw.key,
-			// On legacy (non-Kitty) terminals ctrl+/ sends byte 0x1f which
-			// pi-tui parses as "ctrl+_", so we register/handle both.
 			aliases: raw.key === "ctrl+/" ? ["ctrl+_"] : [],
 			command: typeof raw.command === "string" && raw.command !== "" ? raw.command : undefined,
 			name: label,
 			raw: rawSequencesFor(raw.key),
 			mode,
+			width: raw.width ?? "100%",
+			height: raw.height ?? "100%",
 		});
 	}
 	if (out.length === 0) {
-		out.push({ id: "default", key: "ctrl+/", aliases: ["ctrl+_"], name: "Terminal", raw: ["\x1f"], mode: "overlay" });
+		out.push({
+			id: "default",
+			key: "ctrl+/",
+			aliases: ["ctrl+_"],
+			name: "Terminal",
+			raw: ["\x1f"],
+			mode: "overlay",
+			width: "100%",
+			height: "100%",
+		});
 	}
 	return out;
 }
 
-/**
- * Cast a config-supplied key string to pi-tui's KeyId type. The runtime
- * accepts any "modifier+key" string; the union only exists for autocomplete.
- */
 function asKeyId(key: string): KeyId {
 	return key as KeyId;
 }
 
 const entries = loadEntries();
 
-/** Which configured entry does this input chunk belong to, if any? */
 function matchEntry(data: string): TerminalEntry | null {
 	for (const entry of entries) {
 		if (entry.raw.includes(data)) return entry;
@@ -187,50 +458,29 @@ function matchEntry(data: string): TerminalEntry | null {
 	return null;
 }
 
-interface OverlayHandleLike {
-	focus(): void;
-	unfocus(options?: { target?: unknown | null }): void;
-	setHidden(hidden: boolean): void;
-	hide(): void;
+function isDetachKey(data: string, entry: TerminalEntry): boolean {
+	if (matchesKey(data, asKeyId(entry.key))) return true;
+	if (entry.aliases.some((alias) => matchesKey(data, asKeyId(alias)))) return true;
+	if (entry.raw.includes(data)) return true;
+	if (matchesKey(data, "ctrl+z") || data === "\x1a") return true;
+	return false;
 }
 
-interface TerminalSession {
-	entry: TerminalEntry;
-	term: Terminal;
-	pty: IPty;
-	handle: OverlayHandleLike | null;
-	done: (() => void) | null;
-	visible: boolean;
-	cols: number;
-	rows: number;
-	tui: TUI | null;
-	prevShowHardwareCursor: boolean;
-}
-
-const sessions = new Map<string, TerminalSession>();
-/** Handlers per entry id, used to switch between terminals from handleInput. */
 const entryHandlers = new Map<string, (ctx: ExtensionContext) => Promise<void>>();
 
-function desiredRows(tuiHeight: number): number {
-	// Fill the full height (minus a small margin for pi's own chrome)
-	return Math.max(6, tuiHeight - 2);
+function desiredRows(tuiHeight: number, configuredHeight?: string): number {
+	return parseDimension(configuredHeight, tuiHeight, tuiHeight);
 }
 
 // ---------------------------------------------------------------------------
 // Kitty keyboard protocol -> legacy sequence translation
-//
-// When pi enables the Kitty keyboard protocol on the real terminal, raw
-// CSI-u sequences reach handleInput(). Programs inside the PTY expect
-// legacy sequences, so we translate before writing.
 // ---------------------------------------------------------------------------
 
-// Kitty reports these both as control codepoints (with disambiguate flag)
-// and as 5734x functional codes depending on flags.
 const FUNCTIONAL_LEGACY: Record<number, string> = {
-	27: "\x1b", // escape
-	13: "\r", // enter
-	9: "\t", // tab
-	127: "\x7f", // backspace
+	27: "\x1b",
+	13: "\r",
+	9: "\t",
+	127: "\x7f",
 	57344: "\x1b",
 	57345: "\r",
 	57346: "\t",
@@ -238,35 +488,33 @@ const FUNCTIONAL_LEGACY: Record<number, string> = {
 };
 
 const TILDE_KEYS: Record<number, string> = {
-	57348: "2", // insert
-	57349: "3", // delete
-	57354: "5", // page up
-	57355: "6", // page down
+	57348: "2",
+	57349: "3",
+	57354: "5",
+	57355: "6",
 };
 
 const ARROW_KEYS: Record<number, string> = {
-	57350: "D", // left
-	57351: "C", // right
-	57352: "B", // down
-	57353: "A", // up
+	57350: "D",
+	57351: "C",
+	57352: "B",
+	57353: "A",
 };
 
 const HOME_END: Record<number, string> = {
-	57356: "H", // home
-	57357: "F", // end
+	57356: "H",
+	57357: "F",
 };
 
-/** Translate one parsed CSI-u sequence to its legacy equivalent, or null if not representable. */
 function kittyToLegacy(codepoint: number, mods: number): string | null {
 	const shift = (mods & 1) !== 0;
 	const alt = (mods & 2) !== 0;
 	const ctrl = (mods & 4) !== 0;
 
-	if (codepoint >= 57358 && codepoint <= 57363) return null; // caps lock etc.
+	if (codepoint >= 57358 && codepoint <= 57363) return null;
 	if (codepoint >= 57364 && codepoint <= 57398) {
-		// F1-F35 -> legacy \x1b[11~ .. \x1b[26~, \x1b[15;17~ style with mods
 		const f = codepoint - 57363;
-		const legacyNum = f <= 5 ? f + 10 : f === 6 ? 16 : f + 10; // rough mapping for F1..F12
+		const legacyNum = f <= 5 ? f + 10 : f === 6 ? 16 : f + 10;
 		const n = Math.min(legacyNum, 24);
 		return mods > 1 ? `\x1b[${n};${mods}~` : `\x1b[${n}~`;
 	}
@@ -310,36 +558,26 @@ function kittyToLegacy(codepoint: number, mods: number): string | null {
 		if (ch === "[") return alt ? "\x1b\x1b" : "\x1b";
 		if (ch === "\\") return "\x1c";
 		if (ch === "]") return "\x1d";
-		return shift ? ch : null; // best effort
+		return shift ? ch : null;
 	}
 
 	if (alt) return `\x1b${ch}`;
-
-	// Shifted symbol handling is left to the terminal's alternate-key report,
-	// which we ignore; plain codepoint is the common case.
 	return ch;
 }
 
-/**
- * Translate a chunk of possibly-Kitty-encoded input into legacy bytes for
- * the PTY. Non-CSI-u chunks pass through untouched.
- */
 export function translateInput(data: string): string {
-	// CSI <code(:sub)*> [;<mods(:sub)*>] u   (also handles multiple trailing params)
 	return data.replace(
 		/\x1b\[(\d+(?::\d+)*)(?:;(\d+(?::\d+)*))*u/g,
-		(match, codeStr: string, modsStr?: string) => {
+		(match, _codeStr: string, modsStr?: string) => {
 			const parts = match.split(/[;u]/).filter((p) => p !== "");
-			// parts[0] starts with \x1b[
 			const code = Number.parseInt(parts[0]!.slice(2).split(":")[0]!, 10);
 			if (Number.isNaN(code)) return match;
 			const modsPart = parts.find((p, i) => i > 0 && !p.includes(":") && Number.parseInt(p, 10) > 1);
 			const modsRaw = modsStr ?? modsPart ?? "1";
 			const mods = Number.parseInt(String(modsRaw).split(":")[0]!, 10);
 			if (Number.isNaN(mods)) return match;
-			// Release/repeat events carry event types; only forward presses (type absent or 1)
 			const eventType = (modsStr ?? modsRaw).toString().split(":")[1];
-			if (eventType === "3") return ""; // key release
+			if (eventType === "3") return "";
 
 			const translated = kittyToLegacy(code, mods);
 			return translated ?? match;
@@ -421,14 +659,9 @@ export function renderRow(term: Terminal, y: number, cursorX: number, cursorY: n
 }
 
 // ---------------------------------------------------------------------------
-// Session management
+// Node-PTY spawn-helper self-healing
 // ---------------------------------------------------------------------------
 
-/**
- * Locate node-pty's spawn-helper binary and make sure it is executable.
- * npm can strip the exec bit when install scripts are blocked, which makes
- * pty.spawn() fail with a cryptic "posix_spawnp failed.".
- */
 export function ensureSpawnHelperExecutable(): void {
 	const platformArch = `${process.platform}-${process.arch}`;
 	const candidates = [
@@ -441,31 +674,22 @@ export function ensureSpawnHelperExecutable(): void {
 			const helper = join(base, rel);
 			if (!existsSync(helper)) continue;
 			try {
-				chmodSync(helper, 0o755); // idempotent, cheap
-			} catch {
-				// best effort; spawn will report the real error if it persists
-			}
+				chmodSync(helper, 0o755);
+			} catch {}
 			return;
 		}
 	}
 }
 
-/** Candidate directories that may contain the node-pty package. */
 function moduleSearchPaths(): string[] {
 	const paths: string[] = [];
-	// Next to this extension file (works under jiti: __dirname is shimmed)
 	try {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const code = typeof __dirname !== "undefined";
 		if (code && typeof __dirname === "string") {
 			paths.push(join(__dirname, "node_modules", "node-pty"));
 		}
-	} catch {
-		// no __dirname available
-	}
-	// Relative to the running node executable's default global layout
+	} catch {}
 	paths.push(join(execPath, "..", "..", "lib", "node_modules", "node-pty"));
-	// Anything on NODE_PATH
 	for (const p of (process.env.NODE_PATH ?? "").split(delimiter)) {
 		if (p) paths.push(join(p, "node-pty"));
 	}
@@ -476,18 +700,22 @@ function pathJoin(...parts: string[]): string {
 	return parts.join(sep);
 }
 
-function createSession(ctx: ExtensionContext, entry: TerminalEntry): TerminalSession {
+// ---------------------------------------------------------------------------
+// Overlay Session Management (Decoupled Model & View)
+// ---------------------------------------------------------------------------
+
+function createOverlaySession(ctx: ExtensionContext, entry: TerminalEntry): OverlaySession {
 	ensureSpawnHelperExecutable();
 
 	const shell = process.env.SHELL || "/bin/zsh";
-	const cols = 120;
-	const rows = 24;
+	const cols = process.stdout.columns || 120;
+	const rows = desiredRows(process.stdout.rows || 24, entry.height);
 
 	const term = new Terminal({
 		cols,
 		rows,
 		scrollback: 2000,
-		allowProposedApi: true, // needed for buffer.getNullCell()
+		allowProposedApi: true,
 	});
 
 	const pty = spawn(shell, [], {
@@ -502,10 +730,15 @@ function createSession(ctx: ExtensionContext, entry: TerminalEntry): TerminalSes
 		},
 	});
 
+	if (entry.command) {
+		pty.write(`${entry.command}\r`);
+	}
+
 	return {
 		entry,
 		term,
 		pty,
+		pid: pty.pid,
 		handle: null,
 		done: null,
 		visible: false,
@@ -513,28 +746,20 @@ function createSession(ctx: ExtensionContext, entry: TerminalEntry): TerminalSes
 		rows,
 		tui: null,
 		prevShowHardwareCursor: false,
+		startedAt: Date.now(),
 	};
 }
 
-function destroySession(s: TerminalSession): void {
+function destroyOverlaySession(s: OverlaySession): void {
+	s.ptyDataDisposable?.dispose();
+	s.ptyDataDisposable = undefined;
 	try {
 		s.pty.kill();
-	} catch {
-		// already dead
-	}
+	} catch {}
 	s.term.dispose();
 }
 
-async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
-	const s = createSession(ctx, entry);
-	sessions.set(entry.id, s);
-
-	// Run the configured command (if any) once the shell is up. Input written
-	// before the shell reads it is buffered by the tty line discipline.
-	if (entry.command) {
-		s.pty.write(`${entry.command}\r`);
-	}
-
+async function attachOverlayUI(ctx: ExtensionContext, s: OverlaySession): Promise<void> {
 	await ctx.ui.custom(
 		(tui, _theme, _keybindings, done) => {
 			s.tui = tui;
@@ -542,34 +767,37 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 			tui.setShowHardwareCursor(true);
 
 			s.done = () => {
+				s.ptyDataDisposable?.dispose();
+				s.ptyDataDisposable = undefined;
 				tui.setShowHardwareCursor(s.prevShowHardwareCursor);
+				s.handle = null;
+				s.tui = null;
+				s.done = null;
+				s.visible = false;
 				done(undefined);
+				updateFooterStatus(ctx);
 			};
 
-			s.pty.onData((data) => {
-				s.term.write(data, () => tui.requestRender());
-			});
-			s.pty.onExit(() => {
-				if (sessions.get(entry.id) === s) {
-					sessions.delete(entry.id);
-					s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
-					ctx.ui.notify(`${s.entry.name} exited`, "info");
-					s.done?.();
-				}
+			// Throttled data listener: only requests Pi TUI render when visible!
+			s.ptyDataDisposable?.dispose();
+			s.ptyDataDisposable = s.pty.onData((data) => {
+				s.term.write(data, () => {
+					if (s.visible) {
+						tui.requestRender();
+					}
+				});
 			});
 
 			return {
 				focused: true,
 
 				render(width: number): string[] {
-					const rows = desiredRows(tui.terminal.rows);
+					const rows = desiredRows(tui.terminal.rows, s.entry.height);
 					if (width !== s.cols || rows !== s.rows) {
 						try {
 							s.term.resize(width, rows);
 							s.pty.resize(width, rows);
-						} catch {
-							// resize can race with writes; retry next render
-						}
+						} catch {}
 						s.cols = width;
 						s.rows = rows;
 					}
@@ -591,12 +819,10 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 				handleInput(data: string): void {
 					const hit = matchEntry(data);
 					if (hit) {
-						if (hit.id === entry.id) {
-							// Same terminal's hotkey while focused -> hide it
-							hideTerminal(s, ctx);
+						if (hit.id === s.entry.id) {
+							hideOverlayTerminal(s, ctx);
 						} else {
-							// Another terminal's hotkey -> hide this one and switch
-							hideTerminal(s, ctx);
+							hideOverlayTerminal(s, ctx);
 							setTimeout(() => {
 								void entryHandlers.get(hit.id)?.(ctx);
 							}, 0);
@@ -610,110 +836,494 @@ async function openTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promis
 		{
 			overlay: true,
 			overlayOptions: {
-				width: "100%",
-				maxHeight: "100%",
+				width: (s.entry.width ?? "100%") as any,
+				maxHeight: (s.entry.height ?? "100%") as any,
 				anchor: "center",
 			},
 			onHandle: (handle) => {
 				s.handle = handle as OverlayHandleLike;
 				s.visible = true;
+				updateFooterStatus(ctx);
 			},
 		},
 	);
-
-	// done() fired (pty exited or shutdown): clean up remaining state
-	if (sessions.get(entry.id) === s) {
-		sessions.delete(entry.id);
-		destroySession(s);
-	}
 }
 
-function hideTerminal(s: TerminalSession, ctx: ExtensionContext): void {
+async function openOverlayTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
+	let s = globalState.overlaySessions.get(entry.id);
+	if (!s) {
+		s = createOverlaySession(ctx, entry);
+		globalState.overlaySessions.set(entry.id, s);
+
+		s.pty.onExit(({ exitCode }) => {
+			if (globalState.overlaySessions.get(entry.id) === s) {
+				globalState.overlaySessions.delete(entry.id);
+				s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
+				s.done?.();
+				destroyOverlaySession(s);
+				ctx.ui.notify(`${s.entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
+				updateFooterStatus(ctx);
+			}
+		});
+	}
+
+	await attachOverlayUI(ctx, s);
+}
+
+function hideOverlayTerminal(s: OverlaySession, ctx: ExtensionContext): void {
 	s.visible = false;
 	s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
 	s.handle?.setHidden(true);
 	s.handle?.unfocus({ target: null });
 	ctx.ui.notify(`${s.entry.name} hidden (${s.entry.key} to show)`, "info");
+	updateFooterStatus(ctx);
 }
 
-/**
- * Run a command in suspend mode: temporarily pauses Pi's TUI and runs the
- * command directly on the host terminal with full interactive stdio.
- *
- * This provides 100% native performance (zero V8 string allocation overhead,
- * no overlay compositing, GPU acceleration, native cursor and mouse handling).
- * Ideal for nvim/vim and heavy TUIs.
- */
-async function runSuspendTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
-	if (!entry.command) return;
+// ---------------------------------------------------------------------------
+// Native Passthrough Mode (Zero-Lag Persistent Editors & TUIs)
+// ---------------------------------------------------------------------------
 
-	await ctx.ui.custom<number | null>((tui, _theme, _keybindings, done) => {
-		// 1. Stop Pi's TUI to release the terminal
+async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
+	let session = globalState.passthroughSessions.get(entry.id);
+
+	if (!session) {
+		ensureSpawnHelperExecutable();
+		const shell = process.env.SHELL || "/bin/zsh";
+		const cols = process.stdout.columns || 120;
+		const rows = process.stdout.rows || 24;
+
+		const pty = spawn(shell, entry.command ? ["-c", entry.command] : [], {
+			name: "xterm-256color",
+			cols,
+			rows,
+			cwd: ctx.cwd,
+			env: {
+				...process.env,
+				TERM: "xterm-256color",
+				COLORTERM: "truecolor",
+			},
+		});
+
+		session = {
+			entry,
+			pty,
+			pid: pty.pid,
+			paused: false,
+			cwd: ctx.cwd,
+			startedAt: Date.now(),
+			detachResolver: null,
+		};
+		globalState.passthroughSessions.set(entry.id, session);
+
+		pty.onExit(({ exitCode }) => {
+			if (globalState.passthroughSessions.get(entry.id) === session) {
+				globalState.passthroughSessions.delete(entry.id);
+				updateFooterStatus(ctx);
+				ctx.ui.notify(`${entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
+				session?.detachResolver?.();
+			}
+		});
+	}
+
+	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
 		tui.stop();
 
-		// 2. Clear screen, home cursor, and explicitly enable the hardware cursor
-		process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
-
-		let exitCode: number | null = 0;
-		try {
-			const shell = process.env.SHELL || "/bin/sh";
-			const result = spawnSync(shell, ["-c", entry.command!], {
-				cwd: ctx.cwd,
-				stdio: "inherit",
-				env: process.env,
-			});
-			exitCode = result.status;
-		} catch {
-			exitCode = 1;
-		} finally {
-			// 3. Restart Pi's TUI and force a full screen refresh
-			tui.start();
-			tui.requestRender(true);
+		if (session!.paused) {
+			try {
+				process.kill(-session!.pid, "SIGCONT");
+			} catch {
+				try {
+					process.kill(session!.pid, "SIGCONT");
+				} catch {}
+			}
+			session!.paused = false;
 		}
 
-		done(exitCode);
+		process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
+
+		const resizeHandler = () => {
+			const cols = process.stdout.columns || 120;
+			const rows = process.stdout.rows || 24;
+			try {
+				session!.pty.resize(cols, rows);
+			} catch {}
+		};
+		process.stdout.on("resize", resizeHandler);
+		resizeHandler();
+
+		try {
+			session!.pty.write("\x0c");
+		} catch {}
+
+		let cleanedUp = false;
+		const cleanup = (shouldPause: boolean) => {
+			if (cleanedUp) return;
+			cleanedUp = true;
+			session!.detachResolver = null;
+
+			process.stdout.off("resize", resizeHandler);
+			process.stdin.off("data", stdinHandler);
+			dataDisposable.dispose();
+
+			try {
+				if (process.stdin.isTTY) {
+					process.stdin.setRawMode(false);
+				}
+				process.stdin.pause();
+			} catch {}
+
+			if (shouldPause && globalState.passthroughSessions.get(entry.id) === session) {
+				session!.paused = true;
+				try {
+					process.kill(-session!.pid, "SIGSTOP");
+				} catch {
+					try {
+						process.kill(session!.pid, "SIGSTOP");
+					} catch {}
+				}
+			}
+
+			process.stdout.write("\x1b[?25h");
+			tui.start();
+			tui.requestRender(true);
+			updateFooterStatus(ctx);
+			done(undefined);
+		};
+
+		session!.detachResolver = () => cleanup(false);
+
+		const dataDisposable = session!.pty.onData((data) => {
+			process.stdout.write(data);
+		});
+
+		const stdinHandler = (chunk: Buffer | string) => {
+			const str = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+
+			const hit = matchEntry(str);
+			if (hit) {
+				if (hit.id === entry.id) {
+					cleanup(true);
+				} else {
+					cleanup(true);
+					setTimeout(() => {
+						void entryHandlers.get(hit.id)?.(ctx);
+					}, 10);
+				}
+				return;
+			}
+
+			if (isDetachKey(str, entry)) {
+				cleanup(true);
+				return;
+			}
+
+			session!.pty.write(str);
+		};
+
+		if (process.stdin.isTTY) {
+			process.stdin.setRawMode(true);
+		}
+		process.stdin.resume();
+		process.stdin.on("data", stdinHandler);
+
+		updateFooterStatus(ctx);
+
 		return { render: () => [], invalidate: () => {} };
 	});
 }
 
-export default function (pi: ExtensionAPI) {
-	async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
-		if (ctx.mode !== "tui") {
-			ctx.ui.notify("Terminal requires interactive mode", "error");
+// ---------------------------------------------------------------------------
+// Footer Status & Inspection Helpers
+// ---------------------------------------------------------------------------
+
+interface SessionInfo {
+	id: string;
+	name: string;
+	mode: "overlay" | "passthrough";
+	pid: number;
+	state: "active" | "hidden" | "suspended";
+	key: string;
+	foregroundCommand: string | null;
+}
+
+function getAllSessionsInfo(): SessionInfo[] {
+	const result: SessionInfo[] = [];
+
+	for (const s of globalState.overlaySessions.values()) {
+		result.push({
+			id: s.entry.id,
+			name: s.entry.name,
+			mode: "overlay",
+			pid: s.pid,
+			state: s.visible ? "active" : "hidden",
+			key: s.entry.key,
+			foregroundCommand: getForegroundProcess(s.pid),
+		});
+	}
+
+	for (const ps of globalState.passthroughSessions.values()) {
+		result.push({
+			id: ps.entry.id,
+			name: ps.entry.name,
+			mode: "passthrough",
+			pid: ps.pid,
+			state: ps.paused ? "suspended" : "active",
+			key: ps.entry.key,
+			foregroundCommand: getForegroundProcess(ps.pid),
+		});
+	}
+
+	return result;
+}
+
+function findSessionId(query: string): string | null {
+	const trimmed = query.trim().toLowerCase();
+	for (const s of globalState.overlaySessions.values()) {
+		if (
+			s.entry.id.toLowerCase() === trimmed ||
+			s.entry.name.toLowerCase() === trimmed ||
+			String(s.pid) === trimmed
+		) {
+			return s.entry.id;
+		}
+	}
+	for (const ps of globalState.passthroughSessions.values()) {
+		if (
+			ps.entry.id.toLowerCase() === trimmed ||
+			ps.entry.name.toLowerCase() === trimmed ||
+			String(ps.pid) === trimmed
+		) {
+			return ps.entry.id;
+		}
+	}
+	return null;
+}
+
+function getFooterStatusText(): string | undefined {
+	const parts: string[] = [];
+
+	for (const ps of globalState.passthroughSessions.values()) {
+		const stateStr = ps.paused ? "suspended" : "active";
+		parts.push(`Editor: ${ps.entry.name} (${stateStr})`);
+	}
+
+	let overlayCount = 0;
+	for (const os of globalState.overlaySessions.values()) {
+		if (os.visible) overlayCount++;
+	}
+	const totalOverlays = globalState.overlaySessions.size;
+	if (totalOverlays > 0) {
+		parts.push(`Terminals: ${totalOverlays} (${overlayCount} visible)`);
+	}
+
+	if (parts.length === 0) return undefined;
+	return parts.join(" | ");
+}
+
+function updateFooterStatus(ctx?: ExtensionContext): void {
+	if (!ctx) return;
+	const text = getFooterStatusText();
+	ctx.ui.setStatus("terminal", text);
+}
+
+async function killSingleSession(id: string): Promise<boolean> {
+	const os = globalState.overlaySessions.get(id);
+	if (os) {
+		globalState.overlaySessions.delete(id);
+		os.ptyDataDisposable?.dispose();
+		os.tui?.setShowHardwareCursor(os.prevShowHardwareCursor);
+		os.done?.();
+		await killProcessTreeGraceful(os.pid);
+		destroyOverlaySession(os);
+		return true;
+	}
+
+	const ps = globalState.passthroughSessions.get(id);
+	if (ps) {
+		globalState.passthroughSessions.delete(id);
+		ps.detachResolver?.();
+		if (ps.paused) {
+			try {
+				process.kill(-ps.pid, "SIGCONT");
+			} catch {
+				try {
+					process.kill(ps.pid, "SIGCONT");
+				} catch {}
+			}
+		}
+		await killProcessTreeGraceful(ps.pid);
+		try {
+			ps.pty.kill();
+		} catch {}
+		return true;
+	}
+
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// /terminal Slash Command
+// ---------------------------------------------------------------------------
+
+async function listTerminals(ctx: ExtensionContext): Promise<void> {
+	const allSessions = getAllSessionsInfo();
+	if (allSessions.length === 0) {
+		ctx.ui.notify("No active terminals or editors running", "info");
+		return;
+	}
+
+	const lines = allSessions.map((info) => {
+		const cmdStr = info.foregroundCommand ? ` (process: ${info.foregroundCommand})` : "";
+		return `• ${info.name} [${info.mode}] - PID ${info.pid}${cmdStr} | ${info.state} | hotkey: ${info.key}`;
+	});
+
+	ctx.ui.notify(`Active sessions:\n${lines.join("\n")}`, "info");
+}
+
+async function killTerminalCommand(ctx: ExtensionContext, target: string): Promise<void> {
+	if (!target) {
+		ctx.ui.notify("Specify a terminal name, PID, or 'all' (e.g. /terminal kill editor)", "error");
+		return;
+	}
+
+	if (target.toLowerCase() === "all") {
+		const count = globalState.overlaySessions.size + globalState.passthroughSessions.size;
+		await killAllSessionsGraceful();
+		globalState.overlaySessions.clear();
+		globalState.passthroughSessions.clear();
+		updateFooterStatus(ctx);
+		ctx.ui.notify(`Terminated ${count} session(s)`, "info");
+		return;
+	}
+
+	const foundId = findSessionId(target);
+	if (!foundId) {
+		ctx.ui.notify(`No active terminal found matching "${target}"`, "error");
+		return;
+	}
+
+	const success = await killSingleSession(foundId);
+	updateFooterStatus(ctx);
+	if (success) {
+		ctx.ui.notify(`Terminated terminal "${foundId}"`, "info");
+	} else {
+		ctx.ui.notify(`Failed to terminate terminal "${foundId}"`, "error");
+	}
+}
+
+async function restartTerminalCommand(ctx: ExtensionContext, target: string): Promise<void> {
+	const foundId = findSessionId(target);
+	const entry = entries.find((e) => e.id === (foundId ?? target) || e.name === target);
+	if (!entry) {
+		ctx.ui.notify(`No terminal configured matching "${target}"`, "error");
+		return;
+	}
+
+	if (foundId) {
+		await killSingleSession(foundId);
+	}
+	ctx.ui.notify(`Restarting "${entry.name}"...`, "info");
+	await handler(ctx, entry);
+}
+
+async function focusTerminalCommand(ctx: ExtensionContext, target: string): Promise<void> {
+	const foundId = findSessionId(target);
+	const entry = entries.find((e) => e.id === (foundId ?? target) || e.name === target);
+	if (!entry) {
+		ctx.ui.notify(`No terminal found matching "${target}"`, "error");
+		return;
+	}
+	await handler(ctx, entry);
+}
+
+async function showInteractiveTerminalMenu(ctx: ExtensionContext): Promise<void> {
+	const allSessions = getAllSessionsInfo();
+
+	if (allSessions.length === 0) {
+		const configured = entries.map(
+			(e) => `${e.name} (${e.key}) - ${e.command ? e.command : "Shell"} [${e.mode}]`,
+		);
+		if (configured.length === 0) {
+			ctx.ui.notify("No configured terminals found", "info");
 			return;
 		}
-
-		if (entry.mode === "suspend") {
-			await runSuspendTerminal(ctx, entry);
-			return;
+		const selected = await ctx.ui.select("No active terminals. Launch a configured terminal:", configured);
+		if (selected) {
+			const idx = configured.indexOf(selected);
+			const entry = entries[idx];
+			if (entry) {
+				await handler(ctx, entry);
+			}
 		}
+		return;
+	}
 
-		const session = sessions.get(entry.id);
+	const items = allSessions.map((info) => {
+		const cmd = info.foregroundCommand ? ` [${info.foregroundCommand}]` : "";
+		return `${info.name} (PID ${info.pid}, ${info.state})${cmd} - hotkey: ${info.key}`;
+	});
 
-		// Hidden but alive -> show it again
-		if (session && !session.visible && session.handle) {
+	const selected = await ctx.ui.select("Select terminal or editor to manage:", items);
+	if (!selected) return;
+
+	const selectedIdx = items.indexOf(selected);
+	const selectedSession = allSessions[selectedIdx];
+	if (!selectedSession) return;
+
+	const action = await ctx.ui.select(`Action for "${selectedSession.name}":`, [
+		"Focus / Switch to",
+		"Restart session",
+		"Kill session",
+	]);
+
+	if (action === "Focus / Switch to") {
+		await focusTerminalCommand(ctx, selectedSession.id);
+	} else if (action === "Restart session") {
+		await restartTerminalCommand(ctx, selectedSession.id);
+	} else if (action === "Kill session") {
+		await killTerminalCommand(ctx, selectedSession.id);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Extension Entry Point
+// ---------------------------------------------------------------------------
+
+async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
+	if (ctx.mode !== "tui") {
+		ctx.ui.notify("Terminal requires interactive mode", "error");
+		return;
+	}
+
+	if (entry.mode === "passthrough") {
+		await runPassthroughTerminal(ctx, entry);
+		return;
+	}
+
+	const session = globalState.overlaySessions.get(entry.id);
+
+	if (session && session.handle) {
+		if (!session.visible) {
 			session.visible = true;
 			session.tui?.setShowHardwareCursor(true);
 			session.handle.setHidden(false);
 			session.handle.focus();
+			updateFooterStatus(ctx);
 			return;
 		}
-
-		// Visible shouldn't normally reach here (overlay captures input)
-		if (session?.visible) {
-			hideTerminal(session, ctx);
-			return;
-		}
-
-		// No terminal yet -> create and show it, running any configured command
-		await openTerminal(ctx, entry);
+		hideOverlayTerminal(session, ctx);
+		return;
 	}
 
+	await openOverlayTerminal(ctx, entry);
+}
+
+export default function (pi: ExtensionAPI) {
 	for (const entry of entries) {
 		entryHandlers.set(entry.id, (ctx) => handler(ctx, entry));
 		const description = entry.command
-			? entry.mode === "suspend"
-				? `Open ${entry.name} (${entry.command}) in native terminal`
+			? entry.mode === "passthrough"
+				? `Open ${entry.name} (${entry.command}) with zero-lag native passthrough`
 				: `${entry.name} terminal (${entry.command})`
 			: `Toggle embedded ${entry.name.toLowerCase()} terminal`;
 		for (const key of [entry.key, ...entry.aliases]) {
@@ -721,16 +1331,69 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	pi.registerCommand("terminal", {
+		description: "Manage background terminals and editors (/terminal [list|kill|restart|focus] <name>)",
+		handler: async (args, ctx) => {
+			const rawArgs = (args ?? "").trim();
+			const [subcommand, ...rest] = rawArgs.split(/\s+/);
+			const target = rest.join(" ").trim();
+
+			if (!subcommand || subcommand === "") {
+				await showInteractiveTerminalMenu(ctx);
+				return;
+			}
+
+			switch (subcommand.toLowerCase()) {
+				case "list":
+				case "ls":
+					await listTerminals(ctx);
+					break;
+				case "kill":
+					await killTerminalCommand(ctx, target);
+					break;
+				case "restart":
+					await restartTerminalCommand(ctx, target);
+					break;
+				case "focus":
+				case "open":
+					await focusTerminalCommand(ctx, target);
+					break;
+				default:
+					if (findSessionId(subcommand)) {
+						await focusTerminalCommand(ctx, subcommand);
+					} else {
+						ctx.ui.notify(
+							`Unknown subcommand "${subcommand}". Usage: /terminal [list|kill|restart|focus]`,
+							"error",
+						);
+					}
+					break;
+			}
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		updateFooterStatus(ctx);
+	});
+
 	pi.on("session_shutdown", async (event) => {
-		if (sessions.size === 0) return;
-		// Keep the terminals across /new, /resume, /fork; kill them when quitting.
-		if (event.reason !== "quit") return;
-		const all = [...sessions.values()];
-		sessions.clear();
-		for (const s of all) {
+		if (event.reason === "quit") {
+			await killAllSessionsGraceful();
+			globalState.overlaySessions.clear();
+			globalState.passthroughSessions.clear();
+			return;
+		}
+
+		// Keep sessions alive across /new, /resume, /fork, /reload.
+		// Detach TUI view handles so they can re-attach cleanly in the new session.
+		for (const s of globalState.overlaySessions.values()) {
+			s.ptyDataDisposable?.dispose();
+			s.ptyDataDisposable = undefined;
 			s.tui?.setShowHardwareCursor(s.prevShowHardwareCursor);
-			s.done = null; // don't resolve the custom UI during shutdown
-			destroySession(s);
+			s.handle = null;
+			s.tui = null;
+			s.done = null;
+			s.visible = false;
 		}
 	});
 }
