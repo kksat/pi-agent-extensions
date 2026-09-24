@@ -1146,7 +1146,13 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				return;
 			}
 
-			session!.pty.write(str);
+			// Pi may leave Kitty keyboard protocol sequences enabled on the host
+			// terminal. Normalize them to the legacy bytes expected by TUI apps
+			// such as lazygit (e.g. CSI-u Escape -> a real ESC byte).
+			const translated = translateInput(str);
+			if (translated.length > 0) {
+				session!.pty.write(translated);
+			}
 		};
 
 		// Flush any pending data in stdin buffer before attaching listener
