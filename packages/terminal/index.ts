@@ -1400,95 +1400,89 @@ async function focusTerminalCommand(ctx: ExtensionContext, target: string): Prom
 }
 
 interface MenuAction {
-	action: "focus" | "restart" | "close";
+	action: "focus" | "restart" | "launch" | "close";
 	id?: string;
 }
 
 async function showInteractiveTerminalMenu(ctx: ExtensionContext, scope: "current" | "all"): Promise<void> {
 	let currentScope = scope;
 
-	while (true) {
-		const currentSessionId = ctx.sessionManager?.getSessionId?.() ?? "";
-		const currentCwd = ctx.cwd ?? "";
+	const currentSessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+	const currentCwd = ctx.cwd ?? "";
 
-		const allSessions = getAllSessionsInfo();
-		const filteredSessions =
-			currentScope === "current"
-				? allSessions.filter((s) => s.sessionId === currentSessionId || s.cwd === currentCwd)
-				: allSessions;
+	const getSessionsForScope = (s: "current" | "all") => {
+		const all = getAllSessionsInfo();
+		return s === "current"
+			? all.filter((item) => item.sessionId === currentSessionId || item.cwd === currentCwd)
+			: all;
+	};
 
-		if (filteredSessions.length === 0) {
-			const configured = entries.map(
-				(e) => `${e.name} (${e.key}) - ${e.command ? e.command : "Shell"} [${e.mode}]`,
-			);
-			const title =
+	const menuResult = await ctx.ui.custom<MenuAction>((tui, theme, _keybindings, done) => {
+		let selectedIndex = 0;
+		let activeList = getSessionsForScope(currentScope);
+
+		const renderContent = (width: number): string[] => {
+			const lines: string[] = [];
+			const border = (str: string) => theme.fg("accent", str);
+			const hr = border("─".repeat(Math.max(1, width)));
+
+			lines.push(hr);
+			const scopeLabel =
 				currentScope === "current"
-					? `No active terminals in this session (${ctx.sessionManager?.getSessionName?.() || shortenPath(ctx.cwd)}). Launch configured:`
-					: "No active terminals globally. Launch configured:";
+					? `Session Terminals [${ctx.sessionManager?.getSessionName?.() || shortenPath(ctx.cwd)}]`
+					: "All Terminals (Global)";
+			const scopeToggleHint = currentScope === "current" ? "Tab: view all sessions" : "Tab: view session only";
+			lines.push(
+				`  ${theme.bold(theme.fg("accent", scopeLabel))}  ${theme.fg("dim", `(${activeList.length} active)`)}  ${theme.fg("dim", `[${scopeToggleHint}]`)}`,
+			);
+			lines.push(hr);
 
-			const selected = await ctx.ui.select(title, [
-				...configured,
-				"Switch to " + (currentScope === "current" ? "All Sessions view" : "Current Session view"),
-				"Close menu",
-			]);
-			if (!selected || selected === "Close menu") {
-				return;
-			}
-			if (selected.startsWith("Switch to")) {
-				currentScope = currentScope === "current" ? "all" : "current";
-				continue;
-			}
-			const idx = configured.indexOf(selected);
-			const entry = entries[idx];
-			if (entry) {
-				await handler(ctx, entry);
-			}
-			return;
-		}
-
-		const menuResult = await ctx.ui.custom<MenuAction>((tui, theme, _keybindings, done) => {
-			let selectedIndex = 0;
-			let activeList = [...filteredSessions];
-
-			const renderContent = (width: number): string[] => {
-				const lines: string[] = [];
-				const border = (s: string) => theme.fg("accent", s);
-				const hr = border("─".repeat(Math.max(1, width)));
-
-				lines.push(hr);
-				const scopeLabel =
+			if (activeList.length === 0) {
+				const scopeMsg =
 					currentScope === "current"
-						? `Session Terminals [${ctx.sessionManager?.getSessionName?.() || shortenPath(ctx.cwd)}]`
-						: "All Terminals (Global)";
+						? "No active terminals attached to this session."
+						: "No active terminals running globally.";
+				lines.push(`  ${theme.fg("muted", scopeMsg)}`);
+				lines.push(`  ${theme.fg("dim", "Configured terminals (press [1-9] or Enter to launch):")}`);
+				lines.push("");
+				for (let i = 0; i < entries.length; i++) {
+					const e = entries[i];
+					const isSelected = i === selectedIndex;
+					const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
+					const num = theme.fg("dim", `[${i + 1}]`);
+					const namePart = theme.bold(e.name);
+					const cmdPart = e.command ? theme.fg("muted", `(${e.command})`) : theme.fg("dim", "(shell)");
+					const keyPart = theme.fg("dim", `key: ${e.key}`);
+					lines.push(`  ${pointer}${num} ${namePart} ${cmdPart} [${e.mode}]  ${keyPart}`);
+				}
+				lines.push("");
+				lines.push(hr);
 				lines.push(
-					`  ${theme.bold(theme.fg("accent", scopeLabel))}  ${theme.fg("dim", `(${activeList.length} active)`)}`,
+					`  ${theme.fg("accent", "[Enter/1-9]")} ${theme.fg("dim", "Launch")}  ` +
+						`${theme.fg("accent", "[Tab]")} ${theme.fg("dim", "Toggle scope")}  ` +
+						`${theme.fg("dim", "[Esc/q]")} ${theme.fg("dim", "Close")}`,
 				);
 				lines.push(hr);
+			} else {
+				for (let i = 0; i < activeList.length; i++) {
+					const s = activeList[i];
+					const isSelected = i === selectedIndex;
+					const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
+					const namePart = theme.bold(s.name);
+					const modeBadge = theme.fg("dim", `[${s.mode}]`);
+					const stateColor = s.state === "active" ? "success" : s.state === "suspended" ? "warning" : "muted";
+					const stateBadge = theme.fg(stateColor, `(${s.state})`);
+					const pidPart = theme.fg("dim", `PID: ${s.pid}`);
+					const procPart = s.foregroundCommand ? theme.fg("accent", `[${s.foregroundCommand}]`) : "";
 
-				if (activeList.length === 0) {
-					lines.push(`  ${theme.fg("muted", "No active terminals remaining.")}`);
-					lines.push(`  ${theme.fg("dim", "Press [q] or [Esc] to exit.")}`);
-				} else {
-					for (let i = 0; i < activeList.length; i++) {
-						const s = activeList[i];
-						const isSelected = i === selectedIndex;
-						const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
-						const namePart = theme.bold(s.name);
-						const modeBadge = theme.fg("dim", `[${s.mode}]`);
-						const stateColor = s.state === "active" ? "success" : s.state === "suspended" ? "warning" : "muted";
-						const stateBadge = theme.fg(stateColor, `(${s.state})`);
-						const pidPart = theme.fg("dim", `PID: ${s.pid}`);
-						const procPart = s.foregroundCommand ? theme.fg("accent", `[${s.foregroundCommand}]`) : "";
+					const line1 = `  ${pointer}${namePart} ${modeBadge} ${stateBadge} ${pidPart} ${procPart}`;
+					const folderStr = shortenPath(s.cwd);
+					const line2 = `     ${theme.fg("muted", "Folder:")} ${folderStr}  ${theme.fg("muted", "Session:")} ${s.sessionName}  ${theme.fg("muted", "Key:")} ${s.key}`;
 
-						const line1 = `  ${pointer}${namePart} ${modeBadge} ${stateBadge} ${pidPart} ${procPart}`;
-						const folderStr = shortenPath(s.cwd);
-						const line2 = `     ${theme.fg("muted", "Folder:")} ${folderStr}  ${theme.fg("muted", "Session:")} ${s.sessionName}  ${theme.fg("muted", "Key:")} ${s.key}`;
-
-						lines.push(line1);
-						lines.push(line2);
-						if (i < activeList.length - 1) {
-							lines.push("");
-						}
+					lines.push(line1);
+					lines.push(line2);
+					if (i < activeList.length - 1) {
+						lines.push("");
 					}
 				}
 
@@ -1497,85 +1491,115 @@ async function showInteractiveTerminalMenu(ctx: ExtensionContext, scope: "curren
 					`  ${theme.fg("accent", "[Enter/f]")} ${theme.fg("dim", "Focus")}  ` +
 						`${theme.fg("error", "[x]")} ${theme.fg("dim", "Kill")}  ` +
 						`${theme.fg("warning", "[r]")} ${theme.fg("dim", "Restart")}  ` +
-						`${theme.fg("dim", "[Tab]")} ${theme.fg("dim", "Toggle scope")}  ` +
+						`${theme.fg("accent", "[Tab]")} ${theme.fg("dim", "Toggle scope")}  ` +
 						`${theme.fg("dim", "[Esc/q]")} ${theme.fg("dim", "Close")}`,
 				);
 				lines.push(hr);
+			}
 
-				return lines;
-			};
+			return lines;
+		};
 
-			return {
-				render(width: number) {
-					return renderContent(width);
-				},
-				invalidate() {
+		return {
+			render(width: number) {
+				return renderContent(width);
+			},
+			invalidate() {
+				tui.requestRender(true);
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, "escape") || data === "q" || data === "Q") {
+					done({ action: "close" });
+					return;
+				}
+				if (matchesKey(data, "tab") || data === "\t") {
+					currentScope = currentScope === "current" ? "all" : "current";
+					activeList = getSessionsForScope(currentScope);
+					selectedIndex = 0;
 					tui.requestRender(true);
-				},
-				handleInput(data: string) {
-					if (matchesKey(data, "escape") || data === "q" || data === "Q") {
-						done({ action: "close" });
-						return;
+					return;
+				}
+
+				const maxItems = activeList.length > 0 ? activeList.length : entries.length;
+
+				if (matchesKey(data, "up") || data === "k" || data === "K") {
+					if (maxItems > 0) {
+						selectedIndex = (selectedIndex - 1 + maxItems) % maxItems;
+						tui.requestRender();
 					}
-					if (matchesKey(data, "tab")) {
-						done({ action: "close" });
-						currentScope = currentScope === "current" ? "all" : "current";
-						return;
+					return;
+				}
+				if (matchesKey(data, "down") || data === "j" || data === "J") {
+					if (maxItems > 0) {
+						selectedIndex = (selectedIndex + 1) % maxItems;
+						tui.requestRender();
 					}
-					if (matchesKey(data, "up") || data === "k" || data === "K") {
-						if (activeList.length > 0) {
-							selectedIndex = (selectedIndex - 1 + activeList.length) % activeList.length;
-							tui.requestRender();
-						}
-						return;
-					}
-					if (matchesKey(data, "down") || data === "j" || data === "J") {
-						if (activeList.length > 0) {
-							selectedIndex = (selectedIndex + 1) % activeList.length;
-							tui.requestRender();
-						}
+					return;
+				}
+
+				if (activeList.length === 0) {
+					// Launch configured terminal via number or Enter
+					const num = Number.parseInt(data, 10);
+					if (!Number.isNaN(num) && num >= 1 && num <= entries.length) {
+						done({ action: "launch", id: entries[num - 1]!.id });
 						return;
 					}
 					if (matchesKey(data, "enter") || data === "f" || data === "F") {
-						if (activeList[selectedIndex]) {
-							done({ action: "focus", id: activeList[selectedIndex].id });
+						if (entries[selectedIndex]) {
+							done({ action: "launch", id: entries[selectedIndex]!.id });
 						}
 						return;
 					}
-					if (data === "r" || data === "R") {
-						if (activeList[selectedIndex]) {
-							done({ action: "restart", id: activeList[selectedIndex].id });
-						}
-						return;
-					}
-					if (data === "x" || data === "X") {
-						if (activeList[selectedIndex]) {
-							const toKillId = activeList[selectedIndex].id;
-							void killSingleSession(toKillId).then(() => {
-								activeList = activeList.filter((item) => item.id !== toKillId);
-								if (selectedIndex >= activeList.length) {
-									selectedIndex = Math.max(0, activeList.length - 1);
-								}
-								tui.requestRender(true);
-							});
-						}
-						return;
-					}
-				},
-			};
-		});
+					return;
+				}
 
-		if (menuResult.action === "close") {
-			return;
+				// Active terminals list actions
+				if (matchesKey(data, "enter") || data === "f" || data === "F") {
+					if (activeList[selectedIndex]) {
+						done({ action: "focus", id: activeList[selectedIndex]!.id });
+					}
+					return;
+				}
+				if (data === "r" || data === "R") {
+					if (activeList[selectedIndex]) {
+						done({ action: "restart", id: activeList[selectedIndex]!.id });
+					}
+					return;
+				}
+				if (data === "x" || data === "X") {
+					if (activeList[selectedIndex]) {
+						const toKillId = activeList[selectedIndex]!.id;
+						void killSingleSession(toKillId).then(() => {
+							activeList = getSessionsForScope(currentScope);
+							if (selectedIndex >= activeList.length) {
+								selectedIndex = Math.max(0, activeList.length - 1);
+							}
+							tui.requestRender(true);
+						});
+					}
+					return;
+				}
+			},
+		};
+	});
+
+	if (menuResult.action === "close") {
+		return;
+	}
+	if (menuResult.action === "focus" && menuResult.id) {
+		await focusTerminalCommand(ctx, menuResult.id);
+		return;
+	}
+	if (menuResult.action === "restart" && menuResult.id) {
+		await restartTerminalCommand(ctx, menuResult.id);
+		return;
+	}
+	if (menuResult.action === "launch" && menuResult.id) {
+		const entry = entries.find((e) => e.id === menuResult.id);
+		if (entry) {
+			await handler(ctx, entry);
 		}
-		if (menuResult.action === "focus" && menuResult.id) {
-			await focusTerminalCommand(ctx, menuResult.id);
-			return;
-		}
-		if (menuResult.action === "restart" && menuResult.id) {
-			await restartTerminalCommand(ctx, menuResult.id);
-			return;
-		}
+		return;
 	}
 }
 
