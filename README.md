@@ -6,7 +6,6 @@ A collection of custom [pi](https://pi.dev) packages, each installable separatel
 
 | Package | Description |
 |---|---|
-| [`packages/cursor`](./packages/cursor) | Use Cursor subscription models via the `cursor-agent` CLI bridge |
 | [`packages/worktree`](./packages/worktree) | Manage git worktrees with tmux-integrated pi agents |
 | [`packages/terminal`](./packages/terminal) | Embedded PTY terminal pane toggled with Ctrl+/ |
 | [`packages/vim`](./packages/vim) | Full-featured Vim modal editing for the prompt editor |
@@ -19,7 +18,6 @@ Clone the repo once, then install any package by its local path:
 ```bash
 git clone https://github.com/kksat/pi-agent-extensions.git ~/dev/pi-agent-extensions
 
-pi install ~/dev/pi-agent-extensions/packages/cursor
 pi install ~/dev/pi-agent-extensions/packages/worktree
 pi install ~/dev/pi-agent-extensions/packages/terminal
 pi install ~/dev/pi-agent-extensions/packages/vim
