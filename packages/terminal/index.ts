@@ -15,33 +15,22 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  * Terminals and their hotkeys are configured in ~/.pi/agent/pi-terminal.json:
  *
  *   {
+ *     "gracePeriodMs": 350,
  *     "terminals": [
  *       { "key": "alt+t", "width": "100%", "height": "100%" },
- *       { "key": "alt+e", "command": "nvim", "name": "editor", "mode": "passthrough" }
+ *       { "key": "alt+e", "command": "nvim", "name": "editor", "mode": "passthrough", "gracePeriodMs": 350 }
  *     ]
  *   }
  *
- * Modes:
- * - "passthrough" (default for interactive editors like nvim/vim and heavy TUIs):
- *   Runs outside Pi's DOM/render tree directly on the host terminal with raw I/O.
- *   Eliminates 100% of the transcript re-rendering lag in long conversations.
- *   Pressing alt+e inside the editor suspends it and returns to Pi; pressing alt+e
- *   in Pi wakes it back up without losing open files, buffers, or undo trees.
- * - "overlay" (default for general shells):
- *   Runs in a persistent PTY rendered as a floating overlay pane. Hidden background
- *   tasks are throttled so they never trigger Pi chat transcript re-renders.
- *
- * Session Persistence:
- * - Terminals and editors survive /new, /resume, /fork, and /reload via a global
- *   state bridge, seamlessly reattaching to the active session.
- * - Clean teardown on quit: sends SIGHUP to the entire process group (letting editors
- *   flush buffers cleanly) and escalates to SIGKILL, preventing orphan leaks.
+ * Commands:
+ * - /terminal: Manage terminals attached to the current session (interactive menu with [x] kill, [r] restart, [Enter/f] focus).
+ * - /terminals: Manage all terminals across all sessions and folders globally.
  */
 
 import { execPath } from "node:process";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, readFileSync } from "node:fs";
-import { delimiter, join, sep } from "node:path";
+import { basename, delimiter, join, sep } from "node:path";
 import { spawn } from "node-pty";
 import type { IPty } from "node-pty";
 import { Terminal } from "@xterm/headless";
@@ -77,6 +66,8 @@ export interface TerminalEntry {
 	width: string;
 	/** Overlay height percentage or cell count (defaults to "100%"). */
 	height: string;
+	/** Cooldown grace period (ms) to avoid immediately re-suspending on key repeat/release. */
+	gracePeriodMs: number;
 }
 
 interface OverlayHandleLike {
@@ -99,6 +90,9 @@ export interface OverlaySession {
 	tui: TUI | null;
 	prevShowHardwareCursor: boolean;
 	startedAt: number;
+	sessionId: string;
+	sessionName: string;
+	cwd: string;
 	ptyDataDisposable?: { dispose(): void };
 }
 
@@ -110,6 +104,8 @@ export interface PassthroughSession {
 	paused: boolean;
 	cwd: string;
 	startedAt: number;
+	sessionId: string;
+	sessionName: string;
 	detachResolver: (() => void) | null;
 }
 
@@ -175,7 +171,6 @@ function getForegroundProcess(pid: number): string | null {
 async function killProcessTreeGraceful(pid: number): Promise<void> {
 	const childPids = getChildPids(pid);
 
-	// 1. Send SIGHUP to process group and individual descendants
 	try {
 		process.kill(-pid, "SIGHUP");
 	} catch {
@@ -189,10 +184,8 @@ async function killProcessTreeGraceful(pid: number): Promise<void> {
 		} catch {}
 	}
 
-	// 2. Allow brief grace period for editors/programs to flush buffers & clean up
 	await new Promise((r) => setTimeout(r, 300));
 
-	// 3. Escalate to SIGKILL for any remaining processes
 	const remaining = getChildPids(pid);
 	const toKill = [pid, ...remaining];
 	try {
@@ -286,10 +279,36 @@ if (!globalState.exitHookInstalled) {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal State Normalization (Fixes Terminal Scrolling in Pi)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resets all terminal emulator modes after running an interactive TUI like Neovim.
+ * Explicitly disables mouse tracking, bracketed paste, application cursor keys,
+ * exits alternate screen buffer, and restores the cursor.
+ */
+function resetHostTerminalAfterPassthrough(): void {
+	// 1. Disable all mouse tracking modes:
+	// 1000: normal, 1002: button-event, 1003: any-event, 1006: SGR extended mode
+	const disableMouse = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+	// 2. Disable bracketed paste
+	const disableBracketedPaste = "\x1b[?2004l";
+	// 3. Reset application cursor keys and keypad
+	const resetCursorKeys = "\x1b[?1l\x1b>";
+	// 4. Exit alternate screen back to normal screen buffer
+	const exitAltScreen = "\x1b[?1049l";
+	// 5. Ensure cursor is visible
+	const showCursor = "\x1b[?25h";
+
+	try {
+		process.stdout.write(disableMouse + disableBracketedPaste + resetCursorKeys + exitAltScreen + showCursor);
+	} catch {}
+}
+
+// ---------------------------------------------------------------------------
 // Configuration Loading
 // ---------------------------------------------------------------------------
 
-/** Known interactive commands that benefit from native terminal passthrough mode. */
 const INTERACTIVE_COMMANDS = new Set([
 	"nvim",
 	"vim",
@@ -351,6 +370,13 @@ function rawSequencesFor(key: string): string[] {
 	return out;
 }
 
+function shortenPath(p: string): string {
+	const home = homedir();
+	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+let defaultGracePeriodMs = 350;
+
 function loadEntries(): TerminalEntry[] {
 	let list:
 		| Array<{
@@ -360,27 +386,24 @@ function loadEntries(): TerminalEntry[] {
 				mode?: "overlay" | "passthrough" | "suspend";
 				width?: string;
 				height?: string;
+				gracePeriodMs?: number;
+				cooldownMs?: number;
 		  }>
 		| undefined;
 
 	try {
 		const configPath = join(homedir(), ".pi", "agent", "pi-terminal.json");
 		if (existsSync(configPath)) {
-			const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
+			const parsed: any = JSON.parse(readFileSync(configPath, "utf8"));
+			if (typeof parsed?.gracePeriodMs === "number" && parsed.gracePeriodMs >= 0) {
+				defaultGracePeriodMs = parsed.gracePeriodMs;
+			} else if (typeof parsed?.cooldownMs === "number" && parsed.cooldownMs >= 0) {
+				defaultGracePeriodMs = parsed.cooldownMs;
+			}
+
 			if (Array.isArray(parsed)) list = parsed;
-			else if (parsed && typeof parsed === "object" && Array.isArray((parsed as { terminals?: unknown }).terminals)) {
-				list = (
-					parsed as {
-						terminals: Array<{
-							key?: string;
-							command?: string;
-							name?: string;
-							mode?: "overlay" | "passthrough" | "suspend";
-							width?: string;
-							height?: string;
-						}>;
-					}
-				).terminals;
+			else if (parsed && typeof parsed === "object" && Array.isArray(parsed.terminals)) {
+				list = parsed.terminals;
 			}
 		}
 	} catch {
@@ -402,6 +425,8 @@ function loadEntries(): TerminalEntry[] {
 						? "passthrough"
 						: "overlay";
 
+		const entryGrace = raw.gracePeriodMs ?? raw.cooldownMs ?? defaultGracePeriodMs;
+
 		out.push({
 			id: raw.name ?? raw.command ?? `terminal-${i + 1}`,
 			key: raw.key,
@@ -412,6 +437,7 @@ function loadEntries(): TerminalEntry[] {
 			mode,
 			width: raw.width ?? "100%",
 			height: raw.height ?? "100%",
+			gracePeriodMs: entryGrace,
 		});
 	}
 	if (out.length === 0) {
@@ -424,6 +450,7 @@ function loadEntries(): TerminalEntry[] {
 			mode: "overlay",
 			width: "100%",
 			height: "100%",
+			gracePeriodMs: defaultGracePeriodMs,
 		});
 	}
 	return out;
@@ -563,7 +590,7 @@ export function translateInput(data: string): string {
 			const modsPart = parts.find((p, i) => i > 0 && !p.includes(":") && Number.parseInt(p, 10) > 1);
 			const modsRaw = modsStr ?? modsPart ?? "1";
 			const mods = Number.parseInt(String(modsRaw).split(":")[0]!, 10);
-			if (Number.isNaN(mods)) return match;
+			if (Number.isNaN(code)) return match;
 			const eventType = (modsStr ?? modsRaw).toString().split(":")[1];
 			if (eventType === "3") return "";
 
@@ -735,6 +762,9 @@ function createOverlaySession(ctx: ExtensionContext, entry: TerminalEntry): Over
 		tui: null,
 		prevShowHardwareCursor: false,
 		startedAt: Date.now(),
+		sessionId: ctx.sessionManager?.getSessionId?.() ?? "",
+		sessionName: ctx.sessionManager?.getSessionName?.() || basename(ctx.cwd),
+		cwd: ctx.cwd,
 	};
 }
 
@@ -967,6 +997,8 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				paused: false,
 				cwd: ctx.cwd,
 				startedAt: Date.now(),
+				sessionId: ctx.sessionManager?.getSessionId?.() ?? "",
+				sessionName: ctx.sessionManager?.getSessionName?.() || basename(ctx.cwd),
 				detachResolver: null,
 			};
 			globalState.passthroughSessions.set(entry.id, session);
@@ -977,6 +1009,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 					try {
 						session?.term.dispose();
 					} catch {}
+					resetHostTerminalAfterPassthrough();
 					updateFooterStatus(ctx);
 					ctx.ui.notify(`${entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
 					session?.detachResolver?.();
@@ -1039,9 +1072,15 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			isAttached = false;
 			session!.detachResolver = null;
 
-			process.stdout.off("resize", resizeHandler);
-			process.stdin.off("data", stdinHandler);
-			dataDisposable.dispose();
+			try {
+				process.stdout.off("resize", resizeHandler);
+			} catch {}
+			try {
+				process.stdin.off("data", stdinHandler);
+			} catch {}
+			try {
+				dataDisposable.dispose();
+			} catch {}
 
 			try {
 				if (process.stdin.isTTY) {
@@ -1054,10 +1093,14 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				session!.paused = true;
 			}
 
-			// Exit alternate screen buffer back to main screen for Pi's TUI
-			process.stdout.write("\x1b[?1049l\x1b[?25h");
-			tui.start();
-			tui.requestRender(true);
+			// FULL RESET OF TERMINAL: disable mouse tracking modes, exit alternate screen, restore cursor
+			resetHostTerminalAfterPassthrough();
+
+			try {
+				tui.start();
+				tui.requestRender(true);
+			} catch {}
+
 			updateFooterStatus(ctx);
 			done(undefined);
 		};
@@ -1065,7 +1108,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 		session!.detachResolver = () => cleanup(false);
 
 		const attachedAt = Date.now();
-		const COOLDOWN_MS = 350;
+		const COOLDOWN_MS = entry.gracePeriodMs;
 
 		const stdinHandler = (chunk: Buffer | string) => {
 			const str = typeof chunk === "string" ? chunk : chunk.toString("utf8");
@@ -1135,6 +1178,10 @@ interface SessionInfo {
 	state: "active" | "hidden" | "suspended";
 	key: string;
 	foregroundCommand: string | null;
+	sessionId: string;
+	sessionName: string;
+	cwd: string;
+	startedAt: number;
 }
 
 function getAllSessionsInfo(): SessionInfo[] {
@@ -1149,6 +1196,10 @@ function getAllSessionsInfo(): SessionInfo[] {
 			state: s.visible ? "active" : "hidden",
 			key: s.entry.key,
 			foregroundCommand: getForegroundProcess(s.pid),
+			sessionId: s.sessionId || "",
+			sessionName: s.sessionName || "unknown",
+			cwd: s.cwd || "",
+			startedAt: s.startedAt || 0,
 		});
 	}
 
@@ -1161,30 +1212,26 @@ function getAllSessionsInfo(): SessionInfo[] {
 			state: ps.paused ? "suspended" : "active",
 			key: ps.entry.key,
 			foregroundCommand: getForegroundProcess(ps.pid),
+			sessionId: ps.sessionId || "",
+			sessionName: ps.sessionName || "unknown",
+			cwd: ps.cwd || "",
+			startedAt: ps.startedAt || 0,
 		});
 	}
 
 	return result;
 }
 
-function findSessionId(query: string): string | null {
+function findSessionId(query: string, pool?: SessionInfo[]): string | null {
 	const trimmed = query.trim().toLowerCase();
-	for (const s of globalState.overlaySessions.values()) {
+	const list = pool ?? getAllSessionsInfo();
+	for (const s of list) {
 		if (
-			s.entry.id.toLowerCase() === trimmed ||
-			s.entry.name.toLowerCase() === trimmed ||
+			s.id.toLowerCase() === trimmed ||
+			s.name.toLowerCase() === trimmed ||
 			String(s.pid) === trimmed
 		) {
-			return s.entry.id;
-		}
-	}
-	for (const ps of globalState.passthroughSessions.values()) {
-		if (
-			ps.entry.id.toLowerCase() === trimmed ||
-			ps.entry.name.toLowerCase() === trimmed ||
-			String(ps.pid) === trimmed
-		) {
-			return ps.entry.id;
+			return s.id;
 		}
 	}
 	return null;
@@ -1249,43 +1296,72 @@ async function killSingleSession(id: string): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// /terminal Slash Command
+// /terminal and /terminals Commands & Interactive Menu
 // ---------------------------------------------------------------------------
 
-async function listTerminals(ctx: ExtensionContext): Promise<void> {
+async function listTerminals(ctx: ExtensionContext, scope: "current" | "all"): Promise<void> {
+	const currentSessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+	const currentCwd = ctx.cwd ?? "";
+
 	const allSessions = getAllSessionsInfo();
-	if (allSessions.length === 0) {
-		ctx.ui.notify("No active terminals or editors running", "info");
+	const filtered =
+		scope === "current"
+			? allSessions.filter((s) => s.sessionId === currentSessionId || s.cwd === currentCwd)
+			: allSessions;
+
+	if (filtered.length === 0) {
+		const scopeLabel = scope === "current" ? "this session" : "any session";
+		ctx.ui.notify(`No active terminals or editors running in ${scopeLabel}`, "info");
 		return;
 	}
 
-	const lines = allSessions.map((info) => {
-		const cmdStr = info.foregroundCommand ? ` (process: ${info.foregroundCommand})` : "";
-		return `• ${info.name} [${info.mode}] - PID ${info.pid}${cmdStr} | ${info.state} | hotkey: ${info.key}`;
+	const scopeTitle =
+		scope === "current"
+			? `Active terminals in current session (${ctx.sessionManager?.getSessionName?.() || shortenPath(ctx.cwd)}):`
+			: "All active terminals across sessions:";
+
+	const lines = filtered.map((info) => {
+		const cmdStr = info.foregroundCommand ? ` [proc: ${info.foregroundCommand}]` : "";
+		return `• ${info.name} [${info.mode}] (PID ${info.pid}${cmdStr}) | ${info.state} | Folder: ${shortenPath(info.cwd)} | Session: ${info.sessionName} | Key: ${info.key}`;
 	});
 
-	ctx.ui.notify(`Active sessions:\n${lines.join("\n")}`, "info");
+	ctx.ui.notify(`${scopeTitle}\n${lines.join("\n")}`, "info");
 }
 
-async function killTerminalCommand(ctx: ExtensionContext, target: string): Promise<void> {
+async function killTerminalCommand(ctx: ExtensionContext, target: string, scope: "current" | "all"): Promise<void> {
 	if (!target) {
 		ctx.ui.notify("Specify a terminal name, PID, or 'all' (e.g. /terminal kill editor)", "error");
 		return;
 	}
 
+	const currentSessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+	const currentCwd = ctx.cwd ?? "";
+
 	if (target.toLowerCase() === "all") {
-		const count = globalState.overlaySessions.size + globalState.passthroughSessions.size;
-		await killAllSessionsGraceful();
-		globalState.overlaySessions.clear();
-		globalState.passthroughSessions.clear();
+		const allSessions = getAllSessionsInfo();
+		const toKill =
+			scope === "current"
+				? allSessions.filter((s) => s.sessionId === currentSessionId || s.cwd === currentCwd)
+				: allSessions;
+
+		for (const s of toKill) {
+			await killSingleSession(s.id);
+		}
 		updateFooterStatus(ctx);
-		ctx.ui.notify(`Terminated ${count} session(s)`, "info");
+		ctx.ui.notify(`Terminated ${toKill.length} session(s)`, "info");
 		return;
 	}
 
-	const foundId = findSessionId(target);
+	const allSessions = getAllSessionsInfo();
+	const pool =
+		scope === "current"
+			? allSessions.filter((s) => s.sessionId === currentSessionId || s.cwd === currentCwd)
+			: allSessions;
+
+	const foundId = findSessionId(target, pool);
 	if (!foundId) {
-		ctx.ui.notify(`No active terminal found matching "${target}"`, "error");
+		const scopeLabel = scope === "current" ? "in this session" : "globally";
+		ctx.ui.notify(`No active terminal found matching "${target}" ${scopeLabel}`, "error");
 		return;
 	}
 
@@ -1323,52 +1399,226 @@ async function focusTerminalCommand(ctx: ExtensionContext, target: string): Prom
 	await handler(ctx, entry);
 }
 
-async function showInteractiveTerminalMenu(ctx: ExtensionContext): Promise<void> {
-	const allSessions = getAllSessionsInfo();
+interface MenuAction {
+	action: "focus" | "restart" | "close";
+	id?: string;
+}
 
-	if (allSessions.length === 0) {
-		const configured = entries.map(
-			(e) => `${e.name} (${e.key}) - ${e.command ? e.command : "Shell"} [${e.mode}]`,
-		);
-		if (configured.length === 0) {
-			ctx.ui.notify("No configured terminals found", "info");
-			return;
-		}
-		const selected = await ctx.ui.select("No active terminals. Launch a configured terminal:", configured);
-		if (selected) {
+async function showInteractiveTerminalMenu(ctx: ExtensionContext, scope: "current" | "all"): Promise<void> {
+	let currentScope = scope;
+
+	while (true) {
+		const currentSessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+		const currentCwd = ctx.cwd ?? "";
+
+		const allSessions = getAllSessionsInfo();
+		const filteredSessions =
+			currentScope === "current"
+				? allSessions.filter((s) => s.sessionId === currentSessionId || s.cwd === currentCwd)
+				: allSessions;
+
+		if (filteredSessions.length === 0) {
+			const configured = entries.map(
+				(e) => `${e.name} (${e.key}) - ${e.command ? e.command : "Shell"} [${e.mode}]`,
+			);
+			const title =
+				currentScope === "current"
+					? `No active terminals in this session (${ctx.sessionManager?.getSessionName?.() || shortenPath(ctx.cwd)}). Launch configured:`
+					: "No active terminals globally. Launch configured:";
+
+			const selected = await ctx.ui.select(title, [
+				...configured,
+				"Switch to " + (currentScope === "current" ? "All Sessions view" : "Current Session view"),
+				"Close menu",
+			]);
+			if (!selected || selected === "Close menu") {
+				return;
+			}
+			if (selected.startsWith("Switch to")) {
+				currentScope = currentScope === "current" ? "all" : "current";
+				continue;
+			}
 			const idx = configured.indexOf(selected);
 			const entry = entries[idx];
 			if (entry) {
 				await handler(ctx, entry);
 			}
+			return;
 		}
+
+		const menuResult = await ctx.ui.custom<MenuAction>((tui, theme, _keybindings, done) => {
+			let selectedIndex = 0;
+			let activeList = [...filteredSessions];
+
+			const renderContent = (width: number): string[] => {
+				const lines: string[] = [];
+				const border = (s: string) => theme.fg("accent", s);
+				const hr = border("─".repeat(Math.max(1, width)));
+
+				lines.push(hr);
+				const scopeLabel =
+					currentScope === "current"
+						? `Session Terminals [${ctx.sessionManager?.getSessionName?.() || shortenPath(ctx.cwd)}]`
+						: "All Terminals (Global)";
+				lines.push(
+					`  ${theme.bold(theme.fg("accent", scopeLabel))}  ${theme.fg("dim", `(${activeList.length} active)`)}`,
+				);
+				lines.push(hr);
+
+				if (activeList.length === 0) {
+					lines.push(`  ${theme.fg("muted", "No active terminals remaining.")}`);
+					lines.push(`  ${theme.fg("dim", "Press [q] or [Esc] to exit.")}`);
+				} else {
+					for (let i = 0; i < activeList.length; i++) {
+						const s = activeList[i];
+						const isSelected = i === selectedIndex;
+						const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
+						const namePart = theme.bold(s.name);
+						const modeBadge = theme.fg("dim", `[${s.mode}]`);
+						const stateColor = s.state === "active" ? "success" : s.state === "suspended" ? "warning" : "muted";
+						const stateBadge = theme.fg(stateColor, `(${s.state})`);
+						const pidPart = theme.fg("dim", `PID: ${s.pid}`);
+						const procPart = s.foregroundCommand ? theme.fg("accent", `[${s.foregroundCommand}]`) : "";
+
+						const line1 = `  ${pointer}${namePart} ${modeBadge} ${stateBadge} ${pidPart} ${procPart}`;
+						const folderStr = shortenPath(s.cwd);
+						const line2 = `     ${theme.fg("muted", "Folder:")} ${folderStr}  ${theme.fg("muted", "Session:")} ${s.sessionName}  ${theme.fg("muted", "Key:")} ${s.key}`;
+
+						lines.push(line1);
+						lines.push(line2);
+						if (i < activeList.length - 1) {
+							lines.push("");
+						}
+					}
+				}
+
+				lines.push(hr);
+				lines.push(
+					`  ${theme.fg("accent", "[Enter/f]")} ${theme.fg("dim", "Focus")}  ` +
+						`${theme.fg("error", "[x]")} ${theme.fg("dim", "Kill")}  ` +
+						`${theme.fg("warning", "[r]")} ${theme.fg("dim", "Restart")}  ` +
+						`${theme.fg("dim", "[Tab]")} ${theme.fg("dim", "Toggle scope")}  ` +
+						`${theme.fg("dim", "[Esc/q]")} ${theme.fg("dim", "Close")}`,
+				);
+				lines.push(hr);
+
+				return lines;
+			};
+
+			return {
+				render(width: number) {
+					return renderContent(width);
+				},
+				invalidate() {
+					tui.requestRender(true);
+				},
+				handleInput(data: string) {
+					if (matchesKey(data, "escape") || data === "q" || data === "Q") {
+						done({ action: "close" });
+						return;
+					}
+					if (matchesKey(data, "tab")) {
+						done({ action: "close" });
+						currentScope = currentScope === "current" ? "all" : "current";
+						return;
+					}
+					if (matchesKey(data, "up") || data === "k" || data === "K") {
+						if (activeList.length > 0) {
+							selectedIndex = (selectedIndex - 1 + activeList.length) % activeList.length;
+							tui.requestRender();
+						}
+						return;
+					}
+					if (matchesKey(data, "down") || data === "j" || data === "J") {
+						if (activeList.length > 0) {
+							selectedIndex = (selectedIndex + 1) % activeList.length;
+							tui.requestRender();
+						}
+						return;
+					}
+					if (matchesKey(data, "enter") || data === "f" || data === "F") {
+						if (activeList[selectedIndex]) {
+							done({ action: "focus", id: activeList[selectedIndex].id });
+						}
+						return;
+					}
+					if (data === "r" || data === "R") {
+						if (activeList[selectedIndex]) {
+							done({ action: "restart", id: activeList[selectedIndex].id });
+						}
+						return;
+					}
+					if (data === "x" || data === "X") {
+						if (activeList[selectedIndex]) {
+							const toKillId = activeList[selectedIndex].id;
+							void killSingleSession(toKillId).then(() => {
+								activeList = activeList.filter((item) => item.id !== toKillId);
+								if (selectedIndex >= activeList.length) {
+									selectedIndex = Math.max(0, activeList.length - 1);
+								}
+								tui.requestRender(true);
+							});
+						}
+						return;
+					}
+				},
+			};
+		});
+
+		if (menuResult.action === "close") {
+			return;
+		}
+		if (menuResult.action === "focus" && menuResult.id) {
+			await focusTerminalCommand(ctx, menuResult.id);
+			return;
+		}
+		if (menuResult.action === "restart" && menuResult.id) {
+			await restartTerminalCommand(ctx, menuResult.id);
+			return;
+		}
+	}
+}
+
+async function handleTerminalCommandRoute(
+	args: string | undefined,
+	ctx: ExtensionContext,
+	scope: "current" | "all",
+): Promise<void> {
+	const rawArgs = (args ?? "").trim();
+	const [subcommand, ...rest] = rawArgs.split(/\s+/);
+	const target = rest.join(" ").trim();
+
+	if (!subcommand || subcommand === "") {
+		await showInteractiveTerminalMenu(ctx, scope);
 		return;
 	}
 
-	const items = allSessions.map((info) => {
-		const cmd = info.foregroundCommand ? ` [${info.foregroundCommand}]` : "";
-		return `${info.name} (PID ${info.pid}, ${info.state})${cmd} - hotkey: ${info.key}`;
-	});
-
-	const selected = await ctx.ui.select("Select terminal or editor to manage:", items);
-	if (!selected) return;
-
-	const selectedIdx = items.indexOf(selected);
-	const selectedSession = allSessions[selectedIdx];
-	if (!selectedSession) return;
-
-	const action = await ctx.ui.select(`Action for "${selectedSession.name}":`, [
-		"Focus / Switch to",
-		"Restart session",
-		"Kill session",
-	]);
-
-	if (action === "Focus / Switch to") {
-		await focusTerminalCommand(ctx, selectedSession.id);
-	} else if (action === "Restart session") {
-		await restartTerminalCommand(ctx, selectedSession.id);
-	} else if (action === "Kill session") {
-		await killTerminalCommand(ctx, selectedSession.id);
+	switch (subcommand.toLowerCase()) {
+		case "list":
+		case "ls":
+			await listTerminals(ctx, scope);
+			break;
+		case "kill":
+			await killTerminalCommand(ctx, target, scope);
+			break;
+		case "restart":
+			await restartTerminalCommand(ctx, target);
+			break;
+		case "focus":
+		case "open":
+			await focusTerminalCommand(ctx, target);
+			break;
+		default:
+			if (findSessionId(subcommand)) {
+				await focusTerminalCommand(ctx, subcommand);
+			} else {
+				const cmd = scope === "current" ? "/terminal" : "/terminals";
+				ctx.ui.notify(
+					`Unknown subcommand "${subcommand}". Usage: ${cmd} [list|kill|restart|focus]`,
+					"error",
+				);
+			}
+			break;
 	}
 }
 
@@ -1424,43 +1674,16 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("terminal", {
-		description: "Manage background terminals and editors (/terminal [list|kill|restart|focus] <name>)",
+		description: "Manage terminals in the current session (/terminal [list|kill|restart|focus] <name>)",
 		handler: async (args, ctx) => {
-			const rawArgs = (args ?? "").trim();
-			const [subcommand, ...rest] = rawArgs.split(/\s+/);
-			const target = rest.join(" ").trim();
+			await handleTerminalCommandRoute(args, ctx, "current");
+		},
+	});
 
-			if (!subcommand || subcommand === "") {
-				await showInteractiveTerminalMenu(ctx);
-				return;
-			}
-
-			switch (subcommand.toLowerCase()) {
-				case "list":
-				case "ls":
-					await listTerminals(ctx);
-					break;
-				case "kill":
-					await killTerminalCommand(ctx, target);
-					break;
-				case "restart":
-					await restartTerminalCommand(ctx, target);
-					break;
-				case "focus":
-				case "open":
-					await focusTerminalCommand(ctx, target);
-					break;
-				default:
-					if (findSessionId(subcommand)) {
-						await focusTerminalCommand(ctx, subcommand);
-					} else {
-						ctx.ui.notify(
-							`Unknown subcommand "${subcommand}". Usage: /terminal [list|kill|restart|focus]`,
-							"error",
-						);
-					}
-					break;
-			}
+	pi.registerCommand("terminals", {
+		description: "Manage all background terminals globally (/terminals [list|kill|restart|focus] <name>)",
+		handler: async (args, ctx) => {
+			await handleTerminalCommandRoute(args, ctx, "all");
 		},
 	});
 
@@ -1476,8 +1699,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Keep sessions alive across /new, /resume, /fork, /reload.
-		// Detach TUI view handles so they can re-attach cleanly in the new session.
 		for (const s of globalState.overlaySessions.values()) {
 			s.ptyDataDisposable?.dispose();
 			s.ptyDataDisposable = undefined;

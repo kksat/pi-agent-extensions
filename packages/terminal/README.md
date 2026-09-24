@@ -25,11 +25,12 @@ pi install npm:pi-extension-terminal
 
 - **Zero-Lag Native Passthrough Mode:** Run editors like Neovim directly on the host terminal with raw I/O. Completely eliminates chat transcript re-rendering lag in long conversations.
 - **Universal Hotkey Detach/Resume:** Press `alt+e` inside Neovim to suspend it and return to Pi; press `alt+e` in Pi to resume Neovim right where you left off.
+- **Pristine Scroll Recovery:** Terminal mouse tracking, alternate screens, and bracketed paste are cleanly restored on detach so Pi's native trackpad/mouse scrolling works without interference.
 - **Decoupled Cross-Session Persistence:** Terminals and editors survive `/new`, `/resume`, `/fork`, and `/reload`.
 - **Throttled Background Rendering:** Hidden overlay terminals update their VT buffers in memory without triggering Pi transcript re-renders.
-- **Full VT Emulation for Overlays:** `@xterm/headless` + `node-pty` with truecolor, 256 colors, Kitty keyboard translation, and dynamic resizing.
 - **Configurable Dimensions:** Set overlay `width` and `height` per terminal (defaults to full screen `100%`).
-- **Inspection & Management (`/terminal`):** Interactive menu and slash commands to list, focus, restart, or kill running sessions.
+- **Configurable Grace Period:** Adjustable key-repeat cooldown (`gracePeriodMs`) to prevent accidental immediate re-suspends.
+- **Session-Scoped & Global Inspection (`/terminal` and `/terminals`):** Interactive managers showing folder and session name, with quick hotkeys (`[x]` kill, `[r]` restart, `[Enter/f]` focus).
 - **Footer Status Indicators:** See active terminals and suspended editors at a glance in Pi's footer.
 
 ## Usage
@@ -43,9 +44,10 @@ Create `~/.pi/agent/pi-terminal.json` to define any number of independent termin
 
 ```json
 {
+  "gracePeriodMs": 350,
   "terminals": [
     { "key": "alt+t", "width": "100%", "height": "100%" },
-    { "key": "alt+e", "command": "nvim", "name": "editor", "mode": "passthrough" },
+    { "key": "alt+e", "command": "nvim", "name": "editor", "mode": "passthrough", "gracePeriodMs": 350 },
     { "key": "alt+g", "command": "lazygit", "name": "git", "mode": "passthrough" }
   ]
 }
@@ -59,6 +61,7 @@ Create `~/.pi/agent/pi-terminal.json` to define any number of independent termin
 | `mode` | `"passthrough"` (zero-overhead native terminal) or `"overlay"` (embedded floating pane) | `"passthrough"` for interactive editors (`nvim`, `vim`, `nano`, `helix`, etc.) and TUIs (`lazygit`, `htop`); `"overlay"` for shells |
 | `width` | Overlay width percentage or column count | `"100%"` |
 | `height` | Overlay height percentage or row count | `"100%"` |
+| `gracePeriodMs` | Cooldown period in milliseconds to swallow initial key release/repeats | `350` (or root `gracePeriodMs`) |
 
 ### Modes: Passthrough vs. Overlay
 
@@ -70,15 +73,27 @@ Create `~/.pi/agent/pi-terminal.json` to define any number of independent termin
 - **`overlay` mode (default for shells):**
   Runs in a persistent background PTY rendered in a floating overlay pane.
   - Background output is throttled when hidden so active watchers never cause Pi typing lag.
-  - The overlay width and height are configurable (e.g. `"100%"` or `"80%"`).
+  - The overlay width and height are configurable (defaults to `"100%"`).
 
-### Management Command: `/terminal`
+### Commands: `/terminal` and `/terminals`
 
-- `/terminal`: Opens an interactive selector to view, focus, restart, or kill active sessions.
-- `/terminal list`: Shows active sessions, PIDs, running foreground processes, and hotkeys.
-- `/terminal kill <name|all>`: Gracefully terminates a session and its child process tree.
-- `/terminal restart <name>`: Kills and restarts a fresh session.
-- `/terminal focus <name>`: Focuses or resumes the specified terminal.
+- **/terminal:** Manages terminals attached to the **current session** (matching the session ID or current working directory).
+- **/terminals:** Manages **all terminals globally** across all sessions, worktrees, and folders.
+
+Both commands provide an interactive manager with single-key controls:
+- **`↑` / `↓`** (or **`j` / `k`**): Navigate between terminals
+- **`Enter`** or **`f`**: Focus / switch to the selected terminal
+- **`x`**: Kill / close the selected terminal immediately
+- **`r`**: Restart the selected terminal
+- **`Tab`**: Toggle between session-scoped view and global view
+- **`Esc`** or **`q`**: Exit the manager
+
+#### CLI Subcommands:
+
+- `/terminal list` / `/terminals list`: Formatted list showing terminal name, folder, session name, PID, running process, and status.
+- `/terminal kill <name|all>` / `/terminals kill <name|all>`: Gracefully terminate sessions and child process trees.
+- `/terminal restart <name>`: Kill and restart a session.
+- `/terminal focus <name>`: Focus or resume a terminal.
 
 ## License
 
