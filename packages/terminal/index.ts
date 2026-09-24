@@ -891,49 +891,56 @@ function hideOverlayTerminal(s: OverlaySession, ctx: ExtensionContext): void {
 async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
 	let session = globalState.passthroughSessions.get(entry.id);
 
-	if (!session) {
-		ensureSpawnHelperExecutable();
-		const shell = process.env.SHELL || "/bin/zsh";
-		const cols = process.stdout.columns || 120;
-		const rows = process.stdout.rows || 24;
-
-		const pty = spawn(shell, entry.command ? ["-c", entry.command] : [], {
-			name: "xterm-256color",
-			cols,
-			rows,
-			cwd: ctx.cwd,
-			env: {
-				...process.env,
-				TERM: "xterm-256color",
-				COLORTERM: "truecolor",
-			},
-		});
-
-		session = {
-			entry,
-			pty,
-			pid: pty.pid,
-			paused: false,
-			cwd: ctx.cwd,
-			startedAt: Date.now(),
-			detachResolver: null,
-		};
-		globalState.passthroughSessions.set(entry.id, session);
-
-		pty.onExit(({ exitCode }) => {
-			if (globalState.passthroughSessions.get(entry.id) === session) {
-				globalState.passthroughSessions.delete(entry.id);
-				updateFooterStatus(ctx);
-				ctx.ui.notify(`${entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
-				session?.detachResolver?.();
-			}
-		});
-	}
-
 	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
 		tui.stop();
 
-		if (session!.paused) {
+		const isNewSession = !session;
+		if (isNewSession) {
+			ensureSpawnHelperExecutable();
+			const shell = process.env.SHELL || "/bin/zsh";
+			const cols = process.stdout.columns || 120;
+			const rows = process.stdout.rows || 24;
+
+			const pty = spawn(shell, entry.command ? ["-c", entry.command] : [], {
+				name: "xterm-256color",
+				cols,
+				rows,
+				cwd: ctx.cwd,
+				env: {
+					...process.env,
+					TERM: "xterm-256color",
+					COLORTERM: "truecolor",
+				},
+			});
+
+			session = {
+				entry,
+				pty,
+				pid: pty.pid,
+				paused: false,
+				cwd: ctx.cwd,
+				startedAt: Date.now(),
+				detachResolver: null,
+			};
+			globalState.passthroughSessions.set(entry.id, session);
+
+			pty.onExit(({ exitCode }) => {
+				if (globalState.passthroughSessions.get(entry.id) === session) {
+					globalState.passthroughSessions.delete(entry.id);
+					updateFooterStatus(ctx);
+					ctx.ui.notify(`${entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
+					session?.detachResolver?.();
+				}
+			});
+		}
+
+		// Attach PTY output to stdout immediately so no initial draw bytes are lost
+		const dataDisposable = session!.pty.onData((data) => {
+			process.stdout.write(data);
+		});
+
+		if (!isNewSession && session!.paused) {
+			process.stdout.write("\x1b[?1049h\x1b[?25h");
 			try {
 				process.kill(-session!.pid, "SIGCONT");
 			} catch {
@@ -942,9 +949,27 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				} catch {}
 			}
 			session!.paused = false;
-		}
 
-		process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
+			const cols = process.stdout.columns || 120;
+			const rows = process.stdout.rows || 24;
+			try {
+				// Toggle dimensions by 1 row to force kernel TIOCSWINSZ / SIGWINCH
+				session!.pty.resize(cols, rows > 1 ? rows - 1 : rows + 1);
+				session!.pty.resize(cols, rows);
+			} catch {}
+			try {
+				process.kill(-session!.pid, "SIGWINCH");
+			} catch {
+				try {
+					process.kill(session!.pid, "SIGWINCH");
+				} catch {}
+			}
+			try {
+				session!.pty.write("\x0c");
+			} catch {}
+		} else {
+			process.stdout.write("\x1b[?25h");
+		}
 
 		const resizeHandler = () => {
 			const cols = process.stdout.columns || 120;
@@ -955,10 +980,6 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 		};
 		process.stdout.on("resize", resizeHandler);
 		resizeHandler();
-
-		try {
-			session!.pty.write("\x0c");
-		} catch {}
 
 		let cleanedUp = false;
 		const cleanup = (shouldPause: boolean) => {
@@ -988,7 +1009,8 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				}
 			}
 
-			process.stdout.write("\x1b[?25h");
+			// Exit alternate screen buffer back to main screen for Pi's TUI
+			process.stdout.write("\x1b[?1049l\x1b[?25h");
 			tui.start();
 			tui.requestRender(true);
 			updateFooterStatus(ctx);
@@ -996,10 +1018,6 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 		};
 
 		session!.detachResolver = () => cleanup(false);
-
-		const dataDisposable = session!.pty.onData((data) => {
-			process.stdout.write(data);
-		});
 
 		const attachedAt = Date.now();
 		const COOLDOWN_MS = 350;
