@@ -842,6 +842,34 @@ async function attachOverlayUI(ctx: ExtensionContext, s: OverlaySession): Promis
 
 async function openOverlayTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
 	let s = globalState.overlaySessions.get(entry.id);
+
+	if (s) {
+		let isDead = false;
+		if (!s.term || !s.pty) {
+			isDead = true;
+		} else {
+			try {
+				process.kill(s.pid, 0);
+			} catch {
+				isDead = true;
+			}
+		}
+
+		if (isDead) {
+			try {
+				s.ptyDataDisposable?.dispose();
+			} catch {}
+			try {
+				s.term?.dispose();
+			} catch {}
+			try {
+				s.pty?.kill();
+			} catch {}
+			globalState.overlaySessions.delete(entry.id);
+			s = undefined;
+		}
+	}
+
 	if (!s) {
 		s = createOverlaySession(ctx, entry);
 		globalState.overlaySessions.set(entry.id, s);
@@ -876,6 +904,30 @@ function hideOverlayTerminal(s: OverlaySession, ctx: ExtensionContext): void {
 
 async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntry): Promise<void> {
 	let session = globalState.passthroughSessions.get(entry.id);
+
+	if (session) {
+		let isDead = false;
+		if (!session.term || !session.pty) {
+			isDead = true;
+		} else {
+			try {
+				process.kill(session.pid, 0);
+			} catch {
+				isDead = true;
+			}
+		}
+
+		if (isDead) {
+			try {
+				session.term?.dispose();
+			} catch {}
+			try {
+				session.pty?.kill();
+			} catch {}
+			globalState.passthroughSessions.delete(entry.id);
+			session = undefined;
+		}
+	}
 
 	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
 		tui.stop();
@@ -1161,8 +1213,10 @@ function getFooterStatusText(): string | undefined {
 
 function updateFooterStatus(ctx?: ExtensionContext): void {
 	if (!ctx) return;
-	const text = getFooterStatusText();
-	ctx.ui.setStatus("terminal", text);
+	try {
+		const text = getFooterStatusText();
+		ctx.ui.setStatus("terminal", text);
+	} catch {}
 }
 
 async function killSingleSession(id: string): Promise<boolean> {
@@ -1352,6 +1406,11 @@ async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
 }
 
 export default function (pi: ExtensionAPI) {
+	const currentEntries = loadEntries();
+	entries.length = 0;
+	entries.push(...currentEntries);
+	entryHandlers.clear();
+
 	for (const entry of entries) {
 		entryHandlers.set(entry.id, (ctx) => handler(ctx, entry));
 		const description = entry.command
@@ -1427,6 +1486,12 @@ export default function (pi: ExtensionAPI) {
 			s.tui = null;
 			s.done = null;
 			s.visible = false;
+		}
+
+		for (const ps of globalState.passthroughSessions.values()) {
+			ps.detachResolver?.();
+			ps.detachResolver = null;
+			ps.paused = true;
 		}
 	});
 }
