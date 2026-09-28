@@ -1,0 +1,27 @@
+{
+	"name": "pi-extension-cmux-notify",
+	"version": "0.1.0",
+	"description": "pi extension: notify cmux via OSC 777 when a turn settles and the user needs to act",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"cmux",
+		"tmux",
+		"notify"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/cmux-notify"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}
