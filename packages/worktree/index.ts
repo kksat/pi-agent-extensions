@@ -9,10 +9,12 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  * git worktrees running pi coding agents in tmux without prompts.
  *
  * Commands:
- *   /worktree [branch]                - Create worktree & run pi, or open interactive menu if no args
+ *   /worktree [branch]                - Create worktree & run pi, or open the interactive menu if no args.
+ *                                     Sessions is one menu choice. Outside a git repo, that choice opens the usual session list.
  *   /worktree create <branch> [base]  - Create new worktree (optionally from base branch) & run pi
  *   /worktree list                    - List all worktrees with managed & tmux status
- *   /worktree sessions                - Resume a session from any recorded worktree, even if that checkout is gone
+ *   /worktree sessions                - Resume a session from any recorded worktree, even if that checkout is gone.
+ *                                     Outside a git repo, opens the usual session list.
  *   /worktree clean                   - Clean up all managed worktrees and their branches
  *   /worktree remove [branch]         - Remove a specific worktree and delete its branch
  *   /worktree rename [old] [new]      - Rename a worktree's branch
@@ -32,6 +34,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	SessionManager,
+	SessionSelectorComponent,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -39,6 +42,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { routeWorktreeCommand } from "./route.ts";
 
 const WORKTREE_REGISTRY_FILE = "worktrees.json";
 const WORKTREE_ENTRY_TYPE = "worktree-entry";
@@ -1014,6 +1018,60 @@ async function handleSessionsCommand(ctx: ExtensionCommandContext, gitRoot: stri
 	}
 }
 
+function sessionUsesCustomDir(ctx: ExtensionCommandContext): boolean {
+	const manager = ctx.sessionManager as { usesDefaultSessionDir?: () => boolean };
+	return manager.usesDefaultSessionDir?.() === false;
+}
+
+/**
+ * Same picker `/resume` uses: current folder, with Tab for every session.
+ * Used when this directory is not a git repository.
+ */
+async function handleFolderSessionsCommand(ctx: ExtensionCommandContext): Promise<void> {
+	const currentFile = ctx.sessionManager.getSessionFile() ?? undefined;
+	const sessionDir = ctx.sessionManager.getSessionDir();
+	const customDir = sessionUsesCustomDir(ctx);
+
+	const selectedPath = await ctx.ui.custom<string | null>((tui, _theme, keybindings, done) => {
+		return new SessionSelectorComponent(
+			(onProgress, signal) => SessionManager.list(ctx.cwd, sessionDir, onProgress, signal),
+			(onProgress, signal) =>
+				customDir
+					? SessionManager.listAll(sessionDir, onProgress, signal)
+					: SessionManager.listAll(onProgress, signal),
+			(sessionPath) => done(sessionPath),
+			() => done(null),
+			() => done(null),
+			() => tui.requestRender(),
+			{
+				showRenameHint: true,
+				keybindings,
+				renameSession: async (sessionFilePath, nextName) => {
+					const next = (nextName ?? "").trim();
+					if (!next) return;
+					const mgr = SessionManager.open(sessionFilePath);
+					mgr.appendSessionInfo(next);
+				},
+			},
+			currentFile,
+		);
+	});
+	if (!selectedPath) return;
+
+	try {
+		const result = await ctx.switchSession(selectedPath, {
+			withSession: async (next) => {
+				next.ui.notify("Resumed session", "info");
+			},
+		});
+		if (result.cancelled) {
+			ctx.ui.notify("Session switch cancelled.", "info");
+		}
+	} catch (err: any) {
+		ctx.ui.notify(`Failed to resume session: ${err?.message || String(err)}`, "error");
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Interactive UI Menus & Output Formatting
 // ---------------------------------------------------------------------------
@@ -1037,11 +1095,15 @@ function formatWorktreeListText(statuses: FullWorktreeStatus[]): string {
 	return lines.join("\n");
 }
 
-async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+function notifyNeedsGit(ctx: ExtensionCommandContext): void {
+	ctx.ui.notify("Current directory is not inside a git repository.", "error");
+}
+
+async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot: string | null): Promise<void> {
 	const choices = [
 		"➕ Create new worktree",
 		"📋 List all worktrees",
-		"💬 Browse worktree sessions",
+		"💬 Browse sessions",
 		"🔀 Switch/attach to worktree",
 		"✏️  Rename worktree branch",
 		"🗑️  Remove a worktree",
@@ -1052,6 +1114,20 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 	const selected = await ctx.ui.select("Worktree Management", choices);
 	if (!selected) return;
 
+	if (selected.startsWith("💬")) {
+		if (gitRoot) await handleSessionsCommand(ctx, gitRoot);
+		else await handleFolderSessionsCommand(ctx);
+		return;
+	}
+	if (selected.startsWith("❓")) {
+		showHelp(ctx);
+		return;
+	}
+	if (!gitRoot) {
+		notifyNeedsGit(ctx);
+		return;
+	}
+
 	if (selected.startsWith("➕")) {
 		const branch = await ctx.ui.input("Enter new branch name for worktree:");
 		if (!branch || !branch.trim()) return;
@@ -1059,8 +1135,6 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 	} else if (selected.startsWith("📋")) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		ctx.ui.notify(formatWorktreeListText(statuses), "info");
-	} else if (selected.startsWith("💬")) {
-		await handleSessionsCommand(ctx, gitRoot);
 	} else if (selected.startsWith("🔀")) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
@@ -1106,8 +1180,6 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		}
 	} else if (selected.startsWith("🧹")) {
 		await handleCleanCommand(ctx, gitRoot);
-	} else if (selected.startsWith("❓")) {
-		showHelp(ctx);
 	}
 }
 
@@ -1118,7 +1190,9 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree <branch>               Create worktree & run pi agent in tmux without prompt",
 		"  /worktree create <branch> [base] Create worktree from base branch & run pi in tmux",
 		"  /worktree list                   List all worktrees, managed status, and tmux state",
+		"  /worktree                        Interactive menu. Sessions is one choice, next to list and remove",
 		"  /worktree sessions               Resume a session from a recorded worktree, even if it was removed",
+		"                                   Outside a git repo, opens the usual session list",
 		"  /worktree clean                  Clean up all managed worktrees and branches",
 		"  /worktree remove [branch]        Remove specific worktree and delete branch",
 		"  /worktree rename <old> <new>     Rename worktree branch",
@@ -1408,74 +1482,42 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const gitRoot = await getGitRoot(ctx.cwd);
-			if (!gitRoot) {
-				ctx.ui.notify("Error: Current directory is not inside a git repository.", "error");
-				return;
-			}
-
-			const trimmed = args.trim();
-
-			// If no argument provided, open interactive menu
-			if (!trimmed) {
-				await showInteractiveWorktreeMenu(ctx, gitRoot);
-				return;
-			}
-
-			const parts = trimmed.split(/\s+/);
-			const sub = parts[0].toLowerCase();
-			const rest = parts.slice(1).join(" ");
-
-			switch (sub) {
-				case "create":
-				case "add":
-				case "new":
-					await handleCreateCommand(rest, ctx, gitRoot);
-					break;
-
+			// Non-git behavior is decided in routeWorktreeCommand. Do not return early here.
+			const route = routeWorktreeCommand(args, gitRoot);
+			switch (route.type) {
+				case "folder-sessions":
+					await handleFolderSessionsCommand(ctx);
+					return;
+				case "need-git":
+					ctx.ui.notify("Current directory is not inside a git repository.", "error");
+					return;
+				case "menu":
+					await showInteractiveWorktreeMenu(ctx, route.gitRoot);
+					return;
 				case "list":
-				case "ls":
-					await handleListCommand(ctx, gitRoot);
-					break;
-
+					await handleListCommand(ctx, route.gitRoot);
+					return;
 				case "sessions":
-				case "session":
-					await handleSessionsCommand(ctx, gitRoot);
-					break;
-
+					await handleSessionsCommand(ctx, route.gitRoot);
+					return;
 				case "clean":
-				case "cleanup":
-				case "prune":
-					await handleCleanCommand(ctx, gitRoot);
-					break;
-
+					await handleCleanCommand(ctx, route.gitRoot);
+					return;
 				case "remove":
-				case "rm":
-				case "del":
-				case "delete":
-					await handleRemoveCommand(rest, ctx, gitRoot);
-					break;
-
+					await handleRemoveCommand(route.args, ctx, route.gitRoot);
+					return;
 				case "rename":
-				case "mv":
-					await handleRenameCommand(rest, ctx, gitRoot);
-					break;
-
+					await handleRenameCommand(route.args, ctx, route.gitRoot);
+					return;
 				case "switch":
-				case "attach":
-				case "go":
-					await handleSwitchCommand(rest, ctx, gitRoot);
-					break;
-
+					await handleSwitchCommand(route.args, ctx, route.gitRoot);
+					return;
 				case "help":
-				case "--help":
-				case "-h":
 					showHelp(ctx);
-					break;
-
-				default:
-					// Direct branch creation: /worktree <branch-name> [base-branch]
-					await handleCreateCommand(trimmed, ctx, gitRoot);
-					break;
+					return;
+				case "create":
+					await handleCreateCommand(route.args, ctx, route.gitRoot);
+					return;
 			}
 		},
 	});
