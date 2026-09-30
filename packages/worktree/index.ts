@@ -10,11 +10,13 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  *
  * Commands:
  *   /worktree [branch]                - Create worktree & run pi, or open the interactive menu if no args.
- *                                     Sessions is one menu choice. Outside a git repo, that choice opens the usual session list.
+ *                                     Sessions is one menu choice. Inside a git repo it uses a /resume-style picker.
+ *                                     Outside a git repo, that choice opens the usual session list.
  *   /worktree create <branch> [base]  - Create new worktree (optionally from base branch) & run pi
  *   /worktree list                    - List all worktrees with managed & tmux status
  *   /worktree sessions                - Resume a session from any recorded worktree, even if that checkout is gone.
- *                                     Outside a git repo, opens the usual session list.
+ *                                     Tab switches the current folder and all recorded worktrees. Search, sort,
+ *                                     and filter by branch or worktree name. Outside a git repo, opens the usual session list.
  *   /worktree clean                   - Clean up all managed worktrees and their branches
  *   /worktree remove [branch]         - Remove a specific worktree and delete its branch
  *   /worktree rename [old] [new]      - Rename a worktree's branch
@@ -43,6 +45,8 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
+import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
+import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.ts";
 
 const WORKTREE_REGISTRY_FILE = "worktrees.json";
 const WORKTREE_ENTRY_TYPE = "worktree-entry";
@@ -881,48 +885,70 @@ async function getSessionWorktreeSources(gitRoot: string): Promise<WorktreeSessi
 		.map((wt) => ({ branch: wt.branch ?? "(detached)", path: wt.path }));
 }
 
-interface ListedWorktreeSession {
-	session: SessionInfo;
-	branch: string;
-	worktreePath: string;
-	missing: boolean;
-}
-
 function truncateText(text: string, max: number): string {
 	const oneLine = text.replace(/\s+/g, " ").trim();
 	if (oneLine.length <= max) return oneLine;
 	return `${oneLine.slice(0, Math.max(0, max - 1))}…`;
 }
 
-async function listWorktreeSessions(gitRoot: string): Promise<ListedWorktreeSession[]> {
+async function listWorktreeSessions(
+	gitRoot: string,
+	signal?: AbortSignal,
+	sessionDir?: string,
+): Promise<WorktreeSessionRow[]> {
 	const sources = await getSessionWorktreeSources(gitRoot);
-	const listed: ListedWorktreeSession[] = [];
+	const listed: WorktreeSessionRow[] = [];
 	for (const source of sources) {
+		if (signal?.aborted) break;
 		let sessions: SessionInfo[] = [];
 		try {
-			sessions = await SessionManager.list(source.path);
+			sessions = await SessionManager.list(source.path, sessionDir, undefined, signal);
 		} catch {
+			if (signal?.aborted) break;
 			continue;
 		}
 		const missing = !directoryExists(source.path);
 		for (const session of sessions) {
-			listed.push({
-				session,
-				branch: source.branch,
-				worktreePath: source.path,
-				missing,
-			});
+			listed.push(toWorktreeSessionRow(session, { branch: source.branch, path: source.path, missing }));
 		}
 	}
 	listed.sort((a, b) => b.session.modified.getTime() - a.session.modified.getTime());
 	return listed;
 }
 
-function formatSessionChoice(item: ListedWorktreeSession, index: number): string {
+async function branchForDirectory(dir: string): Promise<string> {
+	const res = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], dir);
+	if (res.exitCode !== 0 || !res.stdout || res.stdout === "HEAD") return "(detached)";
+	return res.stdout;
+}
+
+async function loadCurrentFolderRows(
+	cwd: string,
+	gitRoot: string,
+	sessionDir: string | undefined,
+	signal?: AbortSignal,
+): Promise<WorktreeSessionRow[]> {
+	const sessions = await SessionManager.list(cwd, sessionDir, undefined, signal);
+	const sources = await getSessionWorktreeSources(gitRoot);
+	const source = sources.find((item) => sameDirectory(item.path, cwd));
+	const branch = source?.branch ?? (await branchForDirectory(cwd));
+	return sessions
+		.slice()
+		.sort((a, b) => b.modified.getTime() - a.modified.getTime())
+		.map((session) =>
+			toWorktreeSessionRow(session, {
+				branch,
+				path: source?.path ?? cwd,
+				missing: !directoryExists(source?.path ?? cwd),
+			}),
+		);
+}
+
+function formatSessionChoice(item: WorktreeSessionRow, index: number): string {
 	const title = item.session.name?.trim() || truncateText(item.session.firstMessage, 48) || "(empty)";
 	const when = item.session.modified.toISOString().slice(0, 16).replace("T", " ");
 	const state = item.missing ? "missing" : "present";
-	return `${index + 1}. ${item.branch} [${state}] ${title} (${when})`;
+	return `${index + 1}. ${item.branch} · ${item.worktreeName} [${state}] ${title} (${when})`;
 }
 
 interface DestinationChoice {
@@ -959,17 +985,39 @@ async function listResumeDestinations(gitRoot: string, currentCwd: string): Prom
 const OTHER_FOLDER_CHOICE = "Other folder...";
 
 async function handleSessionsCommand(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	ctx.ui.notify("Loading worktree sessions...", "info");
-	const sessions = await listWorktreeSessions(gitRoot);
-	if (sessions.length === 0) {
-		ctx.ui.notify("No sessions found for recorded worktrees.", "info");
-		return;
-	}
+	const customDir = sessionUsesCustomDir(ctx) ? ctx.sessionManager.getSessionDir() : undefined;
+	let picked: WorktreeSessionRow | null = null;
 
-	const labels = sessions.map((session, index) => formatSessionChoice(session, index));
-	const selected = await ctx.ui.select("Worktree sessions", labels);
-	if (!selected) return;
-	const picked = sessions[labels.indexOf(selected)];
+	if (ctx.mode === "tui") {
+		picked = await ctx.ui.custom<WorktreeSessionRow | null>((tui, theme, keybindings, done) => {
+			const visible = Math.max(8, (tui.terminal?.rows ?? 24) - 8);
+			return new WorktreeSessionSelector({
+				theme,
+				keybindings,
+				requestRender: () => tui.requestRender(),
+				maxVisible: visible,
+				currentSessionFilePath: ctx.sessionManager.getSessionFile() ?? undefined,
+				loadCurrent: (signal) => loadCurrentFolderRows(ctx.cwd, gitRoot, ctx.sessionManager.getSessionDir(), signal),
+				loadWorktrees: (signal) => listWorktreeSessions(gitRoot, signal, customDir),
+				onSelect: (row) => done(row),
+				onCancel: () => done(null),
+				renameSession: async (sessionPath, nextName) => {
+					await renameSessionFile(sessionPath, nextName);
+				},
+			});
+		});
+	} else {
+		ctx.ui.notify("Loading worktree sessions...", "info");
+		const sessions = await listWorktreeSessions(gitRoot, undefined, customDir);
+		if (sessions.length === 0) {
+			ctx.ui.notify("No sessions found for recorded worktrees.", "info");
+			return;
+		}
+		const labels = sessions.map((session, index) => formatSessionChoice(session, index));
+		const selected = await ctx.ui.select("Worktree sessions", labels);
+		if (!selected) return;
+		picked = sessions[labels.indexOf(selected)] ?? null;
+	}
 	if (!picked) return;
 
 	const destinations = await listResumeDestinations(gitRoot, ctx.cwd);
@@ -1192,6 +1240,7 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree list                   List all worktrees, managed status, and tmux state",
 		"  /worktree                        Interactive menu. Sessions is one choice, next to list and remove",
 		"  /worktree sessions               Resume a session from a recorded worktree, even if it was removed",
+		"                                   Tab: current folder / all worktrees. Search, sort, filter by branch or worktree",
 		"                                   Outside a git repo, opens the usual session list",
 		"  /worktree clean                  Clean up all managed worktrees and branches",
 		"  /worktree remove [branch]        Remove specific worktree and delete branch",
@@ -1413,7 +1462,7 @@ async function getWorktreeArgumentCompletions(
 	const subcommands = [
 		{ value: "create", label: "create <branch>", description: "Create worktree & run pi" },
 		{ value: "list", label: "list", description: "List all worktrees" },
-		{ value: "sessions", label: "sessions", description: "Resume a session from any recorded worktree" },
+		{ value: "sessions", label: "sessions", description: "Browse worktree sessions and resume one" },
 		{ value: "clean", label: "clean", description: "Clean up managed worktrees & branches" },
 		{ value: "remove", label: "remove <branch>", description: "Remove worktree & delete branch" },
 		{ value: "rename", label: "rename <old> <new>", description: "Rename worktree branch" },
