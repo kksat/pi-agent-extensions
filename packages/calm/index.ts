@@ -1,8 +1,8 @@
 // Vendored from Firstmate (https://github.com/kunchenguid/firstmate) at commit
 // 2bcb88c38921030033a37d67ae4f5d82cea90eb4, .pi/extensions/fm-calm.ts.
 // Local changes: the Calm preference is fixed at ~/.pi/agent/calm, the operational-input
-// helper is fixed at the bundled ./bin script, and the working presentation picks one of
-// 20 scenes at random per run (see lib/fm-calm-animations.ts).
+// helper is fixed at the bundled ./bin script, the working presentation uses a curated
+// animation rotation, and codemode rows are hidden by a presentation-only adapter.
 //
 // Firstmate's home-persistent Pi transcript presentation toggle.
 //
@@ -12,7 +12,7 @@
 // with a disposable component factory, and setHiddenThinkingLabel().
 // ./lib/fm-calm-working-ship.ts owns the animated working presentation this file
 // installs. The focused tests pin those assumptions but never reject a
-// newer Pi solely for its version. The collapsed-thinking and operational-user
+// newer Pi solely for its version. The collapsed-thinking, operational-user, and codemode
 // presentation adapters probe the exact API they patch and degrade independently with a
 // diagnostic (see installCalmPresentationAdapter below) if a future Pi removes it; Pi
 // still exposes no global renderer for arbitrary built-in or custom rows.
@@ -54,11 +54,22 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, getKeybindings, type Component } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
+import {
+  CALM_ANIMATION_GALLERY_WIDGET_KEY,
+  createCalmAnimationGallery,
+} from "./lib/fm-calm-animation-gallery.ts";
+import {
+  CALM_ANIMATIONS,
+  CALM_PROGRESS_ANIMATION_NUMBERS,
+  CALM_WORKING_ANIMATION_NUMBERS,
+} from "./lib/fm-calm-animations.ts";
 import { installCalmAssistantLayout } from "./lib/fm-calm-assistant-layout.ts";
 import { installCalmOperationalUserLayout } from "./lib/fm-calm-operational-user-layout.ts";
+import { installCalmToolLayout } from "./lib/fm-calm-tool-layout.ts";
 import {
   CALM_WORKING_SHIP_WIDGET_KEY,
   createCalmWorkingShipAnimation,
+  createCalmWorkingShipAnimationFor,
   createCalmWorkingShipWidget,
 } from "./lib/fm-calm-working-ship.ts";
 import {
@@ -128,6 +139,7 @@ function installCalmPresentationAdapter(name: string, install: () => void): void
 export default function (pi: ExtensionAPI) {
   installCalmPresentationAdapter("collapsed-thinking", installCalmAssistantLayout);
   installCalmPresentationAdapter("operational-user-row", installCalmOperationalUserLayout);
+  installCalmPresentationAdapter("codemode-tool-row", installCalmToolLayout);
 
   let exportRendering = false;
   let removeTerminalInputHandler: (() => void) | undefined;
@@ -480,6 +492,42 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", (_event, ctx) => {
     agentRunActive = false;
     applyWorkingPresentation(ctx.ui);
+    ctx.ui.setWidget(CALM_ANIMATION_GALLERY_WIDGET_KEY, undefined);
+  });
+
+  pi.registerCommand("calm-preview", {
+    description: "Preview the working rotation; progress shows full-width bars, a number focuses one, all shows the catalogue, off hides.",
+    handler: async (args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("Calm animation preview requires interactive terminal mode.", "warning");
+        return;
+      }
+      const action = args.trim().toLowerCase();
+      const number = /^\d+$/.test(action) ? Number(action) : undefined;
+      if (
+        action !== "" && action !== "on" && action !== "off" && action !== "all" && action !== "progress" &&
+        (number === undefined || number < 1 || number > CALM_ANIMATIONS.length)
+      ) {
+        ctx.ui.notify(`Usage: /calm-preview [on|off|all|progress|1-${CALM_ANIMATIONS.length}]`, "warning");
+        return;
+      }
+      const numbers = number !== undefined ? [number]
+        : action === "all" ? undefined
+        : action === "progress" ? CALM_PROGRESS_ANIMATION_NUMBERS
+        : CALM_WORKING_ANIMATION_NUMBERS;
+      // A widget leaves the ordinary editor focused, so the user can discuss
+      // changes while every scene continues running, even between agent runs.
+      ctx.ui.setWidget(
+        CALM_ANIMATION_GALLERY_WIDGET_KEY,
+        action === "off" ? undefined : (tui) => createCalmWorkingShipWidget(
+          tui,
+          createCalmWorkingShipAnimationFor(createCalmAnimationGallery({
+            numbers,
+            fullWidth: number !== undefined || action === "progress",
+          })),
+        ),
+      );
+    },
   });
 
   pi.registerCommand("calm", {

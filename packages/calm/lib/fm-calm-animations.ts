@@ -425,13 +425,32 @@ const pendulum = defineAnimation("pendulum", {
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 const spinner = defineAnimation("spinner", {
-  createState: () => ({ phase: 0 }),
+  createState: () => ({ x: 0, dir: 1, phase: 0 }),
   tick: (state) => {
     state.phase += 1;
+    if (state.phase % 2 === 0) state.x += state.dir;
+  },
+  clamp: (state, width) => {
+    const span = Math.max(0, width - 5);
+    if (state.x > span) {
+      state.x = span;
+      state.dir = -1;
+    }
+    if (state.x < 0) {
+      state.x = 0;
+      state.dir = 1;
+    }
   },
   paint: (state, width) => {
     const glyph = SPINNER_FRAMES[state.phase % SPINNER_FRAMES.length];
-    return [paintRow(width, [{ at: centered(width, glyph), text: glyph, color: "accent" }])];
+    const at = clampColumn(state.x, width, 5);
+    // A bright five-cell marker travels along a full-width, quiet track.
+    // Keep the braille motion, but never let it disappear as a tiny isolated dot.
+    return [paintRow(width, [
+      { at: 0, text: "─".repeat(Math.max(0, width)), color: "dim" },
+      { at, text: width >= 5 ? `[ ${glyph} ]` : glyph, color: "accent" },
+      { at: at + (width >= 5 ? 2 : 0), text: glyph, color: "bright" },
+    ])];
   },
 });
 
@@ -587,7 +606,113 @@ const windmill = defineAnimation("windmill", {
   },
 });
 
-/** Every scene Calm can show, in a stable order. */
+// Full-width, single-row activity bars. Their cycles are decorative: there is
+// no percentage, ETA, or relationship between the fill and actual agent progress.
+function progressTrack(
+  width: number,
+  paint: (inner: number) => readonly Placement[],
+): CalmAnimationFrame {
+  if (width <= 0) return [];
+  const bordered = width >= 4;
+  const inner = width - (bordered ? 2 : 0);
+  const row = paintRow(inner, [
+    { at: 0, text: "─".repeat(inner), color: "dim" },
+    ...paint(inner),
+  ]);
+  return [bordered ? [
+    { text: "[", color: "dim" },
+    ...row,
+    { text: "]", color: "dim" },
+  ] : row];
+}
+
+/** Traverse the whole track and back in 64 ticks, independent of terminal width. */
+function sweepPosition(phase: number, span: number): number {
+  const step = phase % 64;
+  return Math.round(span * (step <= 32 ? step / 32 : (64 - step) / 32));
+}
+
+const scanner = defineAnimation("scanner", {
+  createState: () => ({ phase: 0 }),
+  tick: (state) => { state.phase += 1; },
+  paint: (state, width) => progressTrack(width, (inner) => {
+    const band = Math.min(inner, Math.max(3, Math.floor(inner / 8)));
+    const at = sweepPosition(state.phase, inner - band);
+    return [
+      { at, text: "━".repeat(band), color: "accent" },
+      { at: at + Math.floor(band / 2), text: "█", color: "bright" },
+    ];
+  }),
+});
+
+const CONVEYOR_PATTERN = ["▓", "▓", "▒", "░", "░", "▒"] as const;
+const conveyor = defineAnimation("conveyor", {
+  createState: () => ({ phase: 0 }),
+  tick: (state) => { state.phase += 1; },
+  paint: (state, width) => progressTrack(width, (inner) =>
+    Array.from({ length: inner }, (_, column): Placement => {
+      const index = ((column - state.phase) % CONVEYOR_PATTERN.length + CONVEYOR_PATTERN.length) % CONVEYOR_PATTERN.length;
+      // Tiny tracks may not fit a whole stripe, so keep their shaded glyphs
+      // green rather than letting the only visible cells fade into the background.
+      return { at: column, text: CONVEYOR_PATTERN[index], color: inner < CONVEYOR_PATTERN.length || index < 2 ? "green" : "dim" };
+    }),
+  ),
+});
+
+const comet = defineAnimation("comet", {
+  createState: () => ({ phase: 0 }),
+  tick: (state) => { state.phase += 1; },
+  paint: (state, width) => progressTrack(width, (inner) => {
+    const head = Math.floor((state.phase % 64) * inner / 64);
+    const tail = Math.min(inner, Math.max(4, Math.floor(inner / 6)));
+    const cells: Placement[] = [];
+    // Oldest tail first, head last; the trail wraps seamlessly at the edges.
+    for (let offset = tail - 1; offset >= 0; offset -= 1) {
+      const fade = offset / tail;
+      cells.push({
+        at: (head - offset + inner) % inner,
+        text: offset === 0 ? "▶" : fade < 0.3 ? "▓" : fade < 0.6 ? "▒" : "░",
+        color: offset === 0 ? "bright" : fade < 0.6 ? "accent" : "dim",
+      });
+    }
+    return cells;
+  }),
+});
+
+const segments = defineAnimation("segments", {
+  createState: () => ({ phase: 0 }),
+  tick: (state) => { state.phase += 1; },
+  paint: (state, width) => progressTrack(width, (inner) => {
+    const count = Math.ceil(inner / 4);
+    const head = Math.floor((state.phase % 64) * count / 64);
+    const cells: Placement[] = [];
+    for (let segment = 0; segment < count; segment += 1) {
+      const trailing = (head - segment + count) % count === 1;
+      cells.push(
+        { at: segment * 4, text: segment === head ? "▰▰▰" : trailing ? "━━━" : "───", color: segment === head ? "bright" : trailing ? "accent" : "dim" },
+        { at: segment * 4 + 3, text: "·", color: "dim" },
+      );
+    }
+    return cells;
+  }),
+});
+
+const zipper = defineAnimation("zipper", {
+  createState: () => ({ phase: 0 }),
+  tick: (state) => { state.phase += 1; },
+  paint: (state, width) => progressTrack(width, (inner) => {
+    const reach = Math.ceil(inner / 2);
+    const fill = 1 + sweepPosition(state.phase, reach - 1);
+    return [
+      { at: 0, text: "━".repeat(fill), color: "accent" },
+      { at: inner - fill, text: "━".repeat(fill), color: "accent" },
+      { at: fill - 1, text: "▶", color: "bright" },
+      { at: inner - fill, text: "◀", color: "bright" },
+    ];
+  }),
+});
+
+/** Every scene Calm can show, in a stable order. Append new scenes; never renumber the originals. */
 export const CALM_ANIMATIONS: readonly CalmAnimationDefinition[] = [
   sailboat,
   fish,
@@ -609,12 +734,25 @@ export const CALM_ANIMATIONS: readonly CalmAnimationDefinition[] = [
   cat,
   coffee,
   windmill,
+  scanner,
+  conveyor,
+  comet,
+  segments,
+  zipper,
 ];
 
 /** The scene names, in the same order as CALM_ANIMATIONS. */
 export const CALM_ANIMATION_NAMES: readonly string[] = CALM_ANIMATIONS.map(
   (animation) => animation.name,
 );
+
+/** Progress/activity previews include the original bar and the five new variants. */
+export const CALM_PROGRESS_ANIMATION_NUMBERS: readonly number[] = [12, 21, 22, 23, 24, 25];
+
+/** Preferred originals plus new progress variants; disliked originals stay preview-only. */
+export const CALM_WORKING_ANIMATION_NUMBERS: readonly number[] = [1, 2, 3, 9, 11, 12, 14, 17, 18, 21, 22, 23, 24, 25];
+export const CALM_WORKING_ANIMATIONS: readonly CalmAnimationDefinition[] =
+  CALM_WORKING_ANIMATION_NUMBERS.map((number) => CALM_ANIMATIONS[number - 1]);
 
 /** Build the scene at `index`, wrapping out-of-range indexes. */
 export function createCalmAnimationSprite(index: number): CalmAnimationSprite {
@@ -623,7 +761,7 @@ export function createCalmAnimationSprite(index: number): CalmAnimationSprite {
   return CALM_ANIMATIONS[normalized].create();
 }
 
-/** Build one scene chosen uniformly at random. */
+/** Build one scene chosen uniformly from the approved working rotation. */
 export function createRandomCalmAnimationSprite(): CalmAnimationSprite {
-  return createCalmAnimationSprite(Math.floor(Math.random() * CALM_ANIMATIONS.length));
+  return CALM_WORKING_ANIMATIONS[Math.floor(Math.random() * CALM_WORKING_ANIMATIONS.length)].create();
 }
