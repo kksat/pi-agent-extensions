@@ -411,6 +411,20 @@ console.log("Running pi-vim unit tests...\n");
 	assertEqual(ed.getText(), "ad\neh\nijkl", "Visual block deletes rectangle");
 }
 
+// Test 27: Bracketed paste inserts literal text in Normal mode
+{
+	const ed = createEditor("");
+	sendKeys(ed, ["\x1b[200~Review underway; LGTM. Please write\x1b[201~"]);
+	assertEqual(ed.getText(), "Review underway; LGTM. Please write", "single-chunk paste is literal in Normal mode");
+	assertEqual(ed.mode, "normal", "paste keeps Normal mode");
+
+	const split = createEditor("");
+	sendKeys(split, ["\x1b[200~agent-", "check dd", "x\x1b[201~"]);
+	assertEqual(split.getText(), "agent-check ddx", "paste split across chunks is literal");
+	sendKeys(split, ["x"]);
+	assertEqual(split.getText(), "agent-check dd", "keys after paste end are Normal-mode commands again");
+}
+
 console.log(`\nTests finished: ${passed} passed, ${failed} failed.\n`);
 if (failed > 0) {
 	process.exit(1);
