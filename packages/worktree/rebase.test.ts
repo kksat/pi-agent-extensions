@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test, type TestContext } from "node:test";
-import { handleWorktreeRebase, isRebaseTarget } from "./rebase.ts";
+import { handleWorktreeRebase, handleWorktreeTip, isRebaseTarget } from "./rebase.ts";
 
 function fixture(t: TestContext, base = "main") {
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-rebase-")));
@@ -44,6 +44,7 @@ function fixture(t: TestContext, base = "main") {
 	git(["worktree", "add", "-b", "feature", feature]);
 
 	async function call(cwd: string, args = "", options: {
+		command?: "rebase" | "tip";
 		chosen?: string;
 		cancel?: boolean;
 		hasUI?: boolean;
@@ -55,7 +56,8 @@ function fixture(t: TestContext, base = "main") {
 		const selections: string[][] = [];
 		const prompts: string[] = [];
 		const commands: Array<{ args: string[]; cwd: string }> = [];
-		await handleWorktreeRebase(args, {
+		const handler = options.command === "rebase" ? handleWorktreeRebase : handleWorktreeTip;
+		await handler(args, {
 			cwd,
 			hasUI: options.hasUI ?? true,
 			isIdle: () => options.idle ?? true,
@@ -92,7 +94,7 @@ function assertNoRebase(result: Awaited<ReturnType<ReturnType<typeof fixture>["c
 	assert.match(result.notices.at(-1)!.text, message);
 }
 
-test("rebase from a linked worktree subdirectory uses local main and leaves main unchanged", async (t) => {
+test("tip from a linked worktree subdirectory uses local main and leaves main unchanged", async (t) => {
 	const f = fixture(t);
 	const oldTip = f.commit(f.feature, "topic.txt", "topic\n");
 	const base = f.commit(f.main, "base.txt", "base\n");
@@ -297,4 +299,235 @@ test("eligibility is based on the branch, not primary checkout or managed status
 		{ path: "/repo", branch: "topic", bare: true },
 		{ path: "/repo", branch: "topic", prunable: true },
 	]) assert.equal(isRebaseTarget(wt), false);
+});
+
+function temporaryCheckout(result: Awaited<ReturnType<ReturnType<typeof fixture>["call"]>>): string {
+	const added = result.commands.find((command) => command.args[0] === "worktree" && command.args[1] === "add");
+	assert.ok(added, "a temporary checkout was created");
+	return added.args[3];
+}
+
+function removeTemporaryFixture(f: ReturnType<typeof fixture>, checkout: string): void {
+	if (fs.existsSync(checkout)) {
+		f.run(["rebase", "--abort"], checkout);
+		f.git(["worktree", "remove", "--", checkout]);
+	}
+	if (fs.existsSync(path.dirname(checkout))) fs.rmdirSync(path.dirname(checkout));
+}
+
+test("rebase replays main onto the current topic from a subdirectory, leaving the topic and aliases unchanged", async (t) => {
+	const f = fixture(t);
+	const topic = f.commit(f.feature, "topic.txt", "topic\n");
+	const main = f.commit(f.main, "main.txt", "main\n");
+	f.git(["branch", "main-alias", main]);
+	f.git(["branch", "topic-alias", topic]);
+	f.git(["config", "rebase.updateRefs", "true"]);
+	const subdir = path.join(f.feature, "subdir");
+	fs.mkdirSync(subdir);
+	const result = await f.call(subdir, "", { command: "rebase" });
+	assert.match(result.notices.at(-1)!.text, /Rebased "main" onto local feature/);
+	assert.equal(result.selections.length, 0);
+	assert.equal(result.prompts.length, 0);
+	f.git(["merge-base", "--is-ancestor", topic, "main"]);
+	assert.notEqual(f.git(["rev-parse", "main"]), main);
+	assert.equal(f.git(["rev-parse", "feature"]), topic);
+	assert.equal(f.git(["rev-parse", "main-alias"]), main);
+	assert.equal(f.git(["rev-parse", "topic-alias"]), topic);
+	assert.equal(f.git(["symbolic-ref", "--short", "HEAD"], f.main), "main");
+	assert.equal(f.git(["symbolic-ref", "--short", "HEAD"], f.feature), "feature");
+	assert.equal(fs.readFileSync(path.join(f.main, "topic.txt"), "utf8"), "topic\n");
+	assert.equal(fs.readFileSync(path.join(f.main, "main.txt"), "utf8"), "main\n");
+});
+
+test("rebase on main picks a topic but mutates the main checkout, not the selected topic", async (t) => {
+	const f = fixture(t);
+	const topic = f.commit(f.feature, "topic.txt", "topic\n");
+	f.commit(f.main, "main.txt", "main\n");
+	const result = await f.call(f.main, "", { command: "rebase" });
+	assert.deepEqual(result.selections, [["feature"]]);
+	const rebase = result.commands.find((command) => command.args.includes("rebase"));
+	assert.equal(rebase?.cwd, f.main);
+	assert.equal(rebase?.args.at(-1), topic);
+	assert.equal(f.git(["rev-parse", "feature"]), topic);
+	f.git(["merge-base", "--is-ancestor", topic, "main"]);
+});
+
+test("explicit rebase source can differ from the invoking topic checkout", async (t) => {
+	const f = fixture(t);
+	const topic = f.commit(f.feature, "topic.txt", "topic\n");
+	f.commit(f.main, "main.txt", "main\n");
+	const other = path.join(path.dirname(f.feature), "other");
+	f.git(["worktree", "add", "-b", "other", other]);
+	const otherHead = f.commit(other, "other.txt", "other\n");
+	const result = await f.call(other, "feature", { command: "rebase" });
+	assert.equal(result.selections.length, 0);
+	f.git(["merge-base", "--is-ancestor", topic, "main"]);
+	assert.equal(f.git(["rev-parse", "feature"]), topic);
+	assert.equal(f.git(["rev-parse", "other"]), otherHead);
+});
+
+test("rebase supports master fallback and prefers the invoking master when main also exists", async (t) => {
+	const f = fixture(t, "master");
+	const topic = f.commit(f.feature, "topic.txt", "topic\n");
+	f.commit(f.main, "master.txt", "master\n");
+	const result = await f.call(f.feature, "", { command: "rebase" });
+	assert.match(result.notices.at(-1)!.text, /Rebased "master" onto local feature/);
+	f.git(["merge-base", "--is-ancestor", topic, "master"]);
+	f.git(["branch", "main"]);
+	const main = f.git(["rev-parse", "main"]);
+	const newerTopic = f.commit(f.feature, "new-topic.txt", "new topic\n");
+	const next = await f.call(f.main, "", { command: "rebase" });
+	assert.match(next.notices.at(-1)!.text, /Rebased "master" onto local feature/);
+	assert.equal(f.git(["rev-parse", "main"]), main);
+	f.git(["merge-base", "--is-ancestor", newerTopic, "master"]);
+});
+
+test("rebase protects untracked, unstaged, and staged main changes even when autostash is configured", async (t) => {
+	const f = fixture(t);
+	f.commit(f.feature, "topic.txt", "topic\n");
+	f.git(["config", "rebase.autoStash", "true"]);
+	const main = f.git(["rev-parse", "main"]);
+	fs.writeFileSync(path.join(f.main, "untracked.txt"), "do not discard\n");
+	assertNoRebase(await f.call(f.feature, "", { command: "rebase" }), /uncommitted or untracked/);
+	fs.unlinkSync(path.join(f.main, "untracked.txt"));
+	fs.writeFileSync(path.join(f.main, "shared.txt"), "dirty\n");
+	assertNoRebase(await f.call(f.feature, "", { command: "rebase" }), /uncommitted or untracked/);
+	f.git(["add", "shared.txt"]);
+	assertNoRebase(await f.call(f.feature, "", { command: "rebase" }), /uncommitted or untracked/);
+	assert.equal(f.git(["rev-parse", "main"]), main);
+	assert.equal(fs.readFileSync(path.join(f.main, "shared.txt"), "utf8"), "dirty\n");
+	assert.equal(f.git(["stash", "list"]), "");
+});
+
+test("rebase uses only the committed topic tip and leaves its uncommitted files untouched", async (t) => {
+	const f = fixture(t);
+	const topic = f.commit(f.feature, "topic.txt", "committed\n");
+	fs.writeFileSync(path.join(f.feature, "topic.txt"), "uncommitted\n");
+	fs.writeFileSync(path.join(f.feature, "untracked.txt"), "untracked\n");
+	const result = await f.call(f.feature, "", { command: "rebase" });
+	assert.match(result.notices.at(-1)!.text, /Rebased "main" onto local feature/);
+	assert.equal(f.git(["rev-parse", "feature"]), topic);
+	assert.equal(fs.readFileSync(path.join(f.feature, "topic.txt"), "utf8"), "uncommitted\n");
+	assert.equal(fs.readFileSync(path.join(f.feature, "untracked.txt"), "utf8"), "untracked\n");
+	assert.equal(fs.readFileSync(path.join(f.main, "topic.txt"), "utf8"), "committed\n");
+	assert.equal(fs.existsSync(path.join(f.main, "untracked.txt")), false);
+});
+
+test("rebase rejects an existing operation in either the main target or topic source", async (t) => {
+	const f = fixture(t);
+	for (const cwd of [f.main, f.feature]) {
+		const marker = path.resolve(cwd, f.git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], cwd));
+		fs.mkdirSync(marker);
+		assertNoRebase(await f.call(f.feature, "", { command: "rebase" }), /already in progress/);
+		fs.rmdirSync(marker);
+	}
+});
+
+test("rebase creates and removes a temporary main checkout without switching the primary topic", async (t) => {
+	const f = fixture(t);
+	const main = f.commit(f.main, "main.txt", "main\n");
+	f.git(["switch", "-c", "primary-topic", "feature"]);
+	const topic = f.commit(f.main, "topic.txt", "topic\n");
+	const result = await f.call(f.main, "", { command: "rebase" });
+	const checkout = temporaryCheckout(result);
+	assert.equal(fs.existsSync(path.dirname(checkout)), false, "the temporary root and checkout are removed");
+	assert.ok(result.commands.some((command) => command.args[0] === "worktree" && command.args[1] === "remove"));
+	assert.ok(!result.commands.some((command) => command.args.includes("--force")));
+	f.git(["merge-base", "--is-ancestor", topic, "main"]);
+	assert.notEqual(f.git(["rev-parse", "main"]), main);
+	assert.equal(f.git(["rev-parse", "primary-topic"]), topic);
+	assert.equal(f.git(["symbolic-ref", "--short", "HEAD"]), "primary-topic");
+	assert.equal(f.git(["show", "main:main.txt"]), "main");
+	assert.equal(fs.existsSync(path.join(f.main, "main.txt")), false);
+});
+
+test("rebase conflicts are resolved in main for every replayed main commit, leaving topic unchanged", async (t) => {
+	const f = fixture(t);
+	const topic = f.commit(f.feature, "shared.txt", "topic\n");
+	f.commit(f.main, "shared.txt", "main first\n");
+	const original = f.commit(f.main, "shared.txt", "main second\n");
+	const result = await f.call(f.feature, "", { command: "rebase" });
+	assert.equal(result.prompts.length, 1);
+	const prompt = result.prompts[0];
+	assert.match(prompt, /\/worktree rebase stopped/);
+	assert.ok(prompt.includes(JSON.stringify(f.main)));
+	assert.ok(prompt.includes('Branch being rebased: "main" onto local "feature"'));
+	assert.ok(prompt.includes(original));
+	assert.ok(prompt.includes(topic));
+	assert.match(prompt, /Do not modify the branch\/worktree being used as the onto source/);
+	assert.equal(f.git(["diff", "--name-only", "--diff-filter=U"]), "shared.txt");
+	assert.equal(f.git(["rev-parse", "feature"]), topic);
+	fs.writeFileSync(path.join(f.main, "shared.txt"), "topic + main first\n");
+	f.git(["add", "--", "shared.txt"]);
+	assert.equal(f.run(["-c", "core.editor=true", "rebase", "--continue"]).exitCode, 1);
+	fs.writeFileSync(path.join(f.main, "shared.txt"), "topic + main first + main second\n");
+	f.git(["add", "--", "shared.txt"]);
+	f.git(["-c", "core.editor=true", "rebase", "--continue"]);
+	f.git(["merge-base", "--is-ancestor", topic, "main"]);
+	assert.equal(f.git(["rev-parse", "feature"]), topic);
+	assert.equal(f.git(["symbolic-ref", "--short", "HEAD"]), "main");
+	assert.equal(f.git(["status", "--porcelain"]), "");
+});
+
+test("conflicted temporary main checkout is retained and the Pi prompt includes safe post-success cleanup", async (t) => {
+	const f = fixture(t);
+	f.commit(f.main, "shared.txt", "main\n");
+	f.git(["switch", "-c", "primary-topic", "feature"]);
+	const topic = f.commit(f.main, "shared.txt", "topic\n");
+	const result = await f.call(f.main, "", { command: "rebase" });
+	const checkout = temporaryCheckout(result);
+	try {
+		assert.equal(result.prompts.length, 1);
+		assert.ok(result.prompts[0].includes(JSON.stringify(checkout)));
+		assert.match(result.prompts[0], /ONLY after successful completion and a clean worktree/);
+		assert.match(result.prompts[0], /Never use --force and never delete the main\/master branch/);
+		assert.equal(fs.existsSync(checkout), true);
+		assert.equal(f.git(["diff", "--name-only", "--diff-filter=U"], checkout), "shared.txt");
+		assert.equal(f.git(["rev-parse", "primary-topic"]), topic);
+		assert.ok(!result.commands.some((command) => command.args[0] === "worktree" && command.args[1] === "remove"));
+	} finally {
+		removeTemporaryFixture(f, checkout);
+	}
+});
+
+test("temporary cleanup failures never force-remove data or delete main", async (t) => {
+	const f = fixture(t);
+	f.git(["switch", "-c", "primary-topic"]);
+	const topic = f.commit(f.main, "topic.txt", "topic\n");
+	const result = await f.call(f.main, "", {
+		command: "rebase",
+		run: (args, cwd) => args[0] === "worktree" && args[1] === "remove"
+			? { stdout: "", stderr: "cannot safely remove", exitCode: 1 } : f.run(args, cwd),
+	});
+	const checkout = temporaryCheckout(result);
+	try {
+		assert.equal(fs.existsSync(checkout), true);
+		assert.match(result.notices.at(-1)!.text, /Could not safely remove temporary checkout/);
+		assert.ok(!result.commands.some((command) => command.args.includes("--force") || command.args.includes("-D")));
+		f.git(["merge-base", "--is-ancestor", topic, "main"]);
+	} finally {
+		removeTemporaryFixture(f, checkout);
+	}
+});
+
+test("an uncertain Git execution retains the temporary checkout but releases in-process locks", async (t) => {
+	const f = fixture(t);
+	f.git(["switch", "-c", "primary-topic"]);
+	f.commit(f.main, "topic.txt", "topic\n");
+	const result = await f.call(f.main, "", {
+		command: "rebase",
+		run: (args, cwd) => {
+			if (args.includes("rebase")) throw new Error("lost Git process");
+			return f.run(args, cwd);
+		},
+	});
+	const checkout = temporaryCheckout(result);
+	try {
+		assert.equal(fs.existsSync(checkout), true);
+		assert.ok(!result.commands.some((command) => command.args[0] === "worktree" && command.args[1] === "remove"));
+		const retried = await f.call(f.main, "", { command: "rebase" });
+		assert.match(retried.notices.at(-1)!.text, /Rebased "main" onto local primary-topic/);
+	} finally {
+		removeTemporaryFixture(f, checkout);
+	}
 });

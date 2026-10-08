@@ -12,7 +12,7 @@ Spin out new features, bugfixes, and experiments into isolated git worktrees run
 - **Sessions across worktrees**: `/worktree sessions` opens a picker like `/resume`, starting with every recorded worktree, including checkouts that no longer exist. Tab switches to the current folder. Search matches the session text, branch, and worktree name (`branch:` and `worktree:` limit a token; Ctrl+Shift+B cycles the field). Sort and the named-session filter use the same keys as `/resume`. Choosing a session forks it into the current folder or another living directory when that folder is not already the session's directory. `git worktree list` is used only when nothing has been written down yet. Outside a git repository, the same command opens the usual session list.
 - **Easy cleanup**: safely kills tmux windows, removes git worktrees, and deletes topic branches with `/worktree clean`. Cleanup drops the active record and leaves the `known` path so its sessions stay reachable.
 - **Flexible management**: list, switch, rename, or remove individual worktrees.
-- **Rebase with Pi conflict resolution**: `/worktree rebase [branch]` rebases the current or selected topic worktree onto local `main`/`master`. If Git stops on conflicts, Pi automatically starts a turn to resolve them and continue the rebase.
+- **Two local rebase directions with Pi conflict resolution**: `/worktree rebase [branch]` replays local `main`/`master` onto the current/selected topic's committed tip; `/worktree tip [branch]` replays the topic onto local `main`/`master`. Pi resolves conflicts in the checkout of the branch actually being rewritten.
 - **PR delivery with verified CI**: `/worktree pr [branch]` selects a clean topic worktree, asks Pi to rebase onto remote `main`/`master`, resolve conflicts, write the body using `/skill:pr`, push the topic branch, create/reuse its PR, and repair CI failures. An independent extension gate verifies the open PR's latest pushed SHA and GitHub checks before marking the workflow green.
 - **Searchable command menu**: `/worktree` with no arguments opens a focused search field above all worktree actions. Type a command name or description to fuzzy-filter and rank matches (for example, `rbs` finds rebase); use ↑/↓ to navigate, Enter to choose, and Escape to cancel. Clearing the search restores the full list. Sessions remains available inside and outside repositories. RPC clients retain the standard selection dialog.
 - **LLM tools**: exposes `worktree_create`, `worktree_list`, `worktree_clean`, `worktree_remove`, and `worktree_rename` to the agent.
@@ -42,17 +42,27 @@ pi install npm:pi-extension-worktree
 | `/worktree remove [branch]` · `/worktree-remove` | Remove one worktree |
 | `/worktree rename <old> <new>` · `/worktree-rename` | Rename a branch |
 | `/worktree switch [branch]` | Switch / attach to its tmux window |
-| `/worktree rebase [branch]` | Rebase the current topic worktree onto local `main`/`master`; on `main`/`master`, select a worktree. Pi resolves conflicts |
+| `/worktree rebase [branch]` | Rebase local `main`/`master` onto the current/selected topic worktree; Pi resolves conflicts in the main/master checkout |
+| `/worktree tip [branch]` | Rebase the current/selected topic worktree onto local `main`/`master`; Pi resolves conflicts in the topic checkout |
 | `/worktree pr [branch]` | Select a topic worktree (or name one), rebase onto remote `main`/`master`, create/reuse its PR with `/skill:pr`, and verify green CI |
 | `/worktree help` | Show help |
 
 ## Rebasing
 
-- In a topic worktree (including a subdirectory), `/worktree rebase` runs the rebase there.
-- On `main` or `master`, `/worktree rebase` opens a topic-worktree picker. `/worktree rebase <branch>` explicitly targets an existing worktree from any checkout. Managed and unmanaged worktrees are supported; the main repository checkout is eligible if it is on a topic branch.
-- This replays the **topic branch onto the base**, not `main`/`master` onto the topic. The invoking `main`/`master` is preferred; from a topic branch, `main` is preferred, with `master` as fallback. Only local base commits are used: update your base first if you want remote changes. The command does not fetch or push.
-- The target must be clean, including untracked files, with no rebase/merge/cherry-pick/revert already in progress. Busy agents and detached HEAD without an explicit target are rejected. No automatic stashing or updates to other branch refs are performed.
-- Conflicts trigger a prompt in the invoking Pi session, scoped to the selected worktree's absolute path. Pi inspects each conflicted commit, resolves and stages the affected files, continues with a noninteractive editor, and verifies completion. Ambiguous resolutions or non-conflict failures require user input; the rebase is left recoverable. Do not run another agent or edit the target worktree while rebasing. Cancelling the Pi turn leaves the rebase paused; resume resolution or run `git -C <worktree-path> rebase --abort` yourself.
+The commands deliberately run in **opposite directions**:
+
+| Command | Branch rewritten | Onto commit | Conflict-resolution checkout |
+|---|---|---|---|
+| `/worktree rebase [topic]` | Local `main`/`master` | Committed tip of the current/selected topic | Checkout holding `main`/`master` |
+| `/worktree tip [topic]` | Current/selected topic | Local `main`/`master` | Selected topic checkout |
+
+- **Selection:** in a topic worktree (including a subdirectory), both commands use that topic by default. On `main`/`master`, both open a topic-worktree picker. An explicit topic branch skips the picker. Managed and unmanaged worktrees are supported, including a topic in the primary checkout.
+- **Default branch:** the invoking `main`/`master` is preferred; from a topic, `main` is preferred with `master` as fallback. Only local committed tips are used; neither command fetches or pushes.
+- **`rebase` changes main/master history:** it executes in the checkout where the chosen default branch is checked out, not in the source topic checkout. That destination must be clean. The topic's committed tip is used and its branch and uncommitted files remain untouched; an unfinished Git operation in the topic is rejected.
+- **Unoccupied main/master:** if the chosen default branch has no checkout, `rebase` creates a temporary worktree outside the repository. It never switches the selected topic checkout to main/master. Successful, clean temporary checkouts are safely removed without deleting the default branch. Conflicted or uncertain checkouts remain intact, and Pi is instructed to remove them only after successful conflict resolution and verification—never with `--force`.
+- **`tip` preserves main/master:** it is the previous `/worktree rebase` behavior under its new name. The topic destination must be clean; uncommitted files in a main/master source checkout remain untouched.
+- **Safety:** the branch being rewritten must have no uncommitted/untracked changes or unfinished Git operation. Busy agents and detached HEAD without an explicit topic are rejected. No automatic stashing, changes to unrelated branch refs, force-removal, or branch deletion are performed.
+- **Conflicts:** Pi's prompt names the branch being rewritten, original/onto commits, and the absolute checkout where the rebase is actually paused. Pi inspects and resolves every conflicted commit, stages only resolved files, continues with a noninteractive editor, and verifies the resulting history. Ambiguous resolutions or non-conflict failures require user input and remain recoverable. Do not edit those checkouts with another agent while rebasing. Cancelling the Pi turn leaves the rebase paused; resume it or run `git -C <actual-rebase-checkout> rebase --abort` yourself. `/worktree pr` remains a topic-onto-remote-main/master workflow.
 
 ## Pull requests
 

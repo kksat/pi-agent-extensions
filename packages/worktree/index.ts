@@ -21,7 +21,8 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  *   /worktree remove [branch]         - Remove a specific worktree and delete its branch
  *   /worktree rename [old] [new]      - Rename a worktree's branch
  *   /worktree switch [branch]         - Switch/attach to a worktree's tmux window or session
- *   /worktree rebase [branch]         - Rebase current/selected topic worktree onto local main/master; Pi resolves conflicts
+ *   /worktree rebase [branch]         - Rebase local main/master onto current/selected topic worktree; Pi resolves conflicts
+ *   /worktree tip [branch]            - Rebase current/selected topic worktree onto local main/master; Pi resolves conflicts
  *   /worktree pr [branch]             - Select a worktree, rebase onto remote main/master, create PR, and ensure green CI
  *   /worktree help                    - Show worktree command help
  *
@@ -48,7 +49,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
 import { selectWorktreeCommand } from "./command-menu.ts";
-import { handleWorktreeRebase, isRebaseTarget } from "./rebase.ts";
+import { handleWorktreeRebase, handleWorktreeTip, isRebaseTarget } from "./rebase.ts";
 import { WorktreePrWorkflow } from "./pr.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
 import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.ts";
@@ -1198,6 +1199,8 @@ async function showInteractiveWorktreeMenu(
 		}
 	} else if (selected === "rebase") {
 		await handleRebaseCommand("", ctx, gitRoot, pi);
+	} else if (selected === "tip") {
+		await handleRebaseCommand("", ctx, gitRoot, pi, "tip");
 	} else if (selected === "pr") {
 		await handlePrCommand("", ctx, gitRoot);
 	} else if (selected === "rename") {
@@ -1249,8 +1252,9 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree remove [branch]        Remove specific worktree and delete branch",
 		"  /worktree rename <old> <new>     Rename worktree branch",
 		"  /worktree switch [branch]        Switch/attach to worktree's tmux window/session",
-		"  /worktree rebase [branch]        Rebase current topic worktree onto local main/master",
-		"                                   On main/master: select a worktree. Pi resolves conflicts",
+		"  /worktree rebase [branch]        Rebase local main/master onto the current/selected topic",
+		"  /worktree tip [branch]           Rebase the current/selected topic onto local main/master",
+		"                                   On main/master: select a topic. Pi resolves conflicts in either direction",
 		"  /worktree pr [branch]            Select a topic worktree, rebase onto remote main/master, create PR",
 		"                                   Use /skill:pr for the body; repair failures until CI is verified green",
 		"  /worktree help                   Show this help message",
@@ -1265,8 +1269,9 @@ function showHelp(ctx: ExtensionContext): void {
 // Command Handlers
 // ---------------------------------------------------------------------------
 
-async function handleRebaseCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string, pi: ExtensionAPI): Promise<void> {
-	await handleWorktreeRebase(args, ctx, gitRoot, {
+async function handleRebaseCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string, pi: ExtensionAPI, command: "rebase" | "tip" = "rebase"): Promise<void> {
+	const handler = command === "tip" ? handleWorktreeTip : handleWorktreeRebase;
+	await handler(args, ctx, gitRoot, {
 		git: (gitArgs, cwd) => exec("git", gitArgs, cwd),
 		getWorktrees: getGitWorktrees,
 		sendUserMessage: (prompt) => pi.sendUserMessage(prompt, { deliverAs: "followUp" }),
@@ -1482,7 +1487,8 @@ async function getWorktreeArgumentCompletions(
 		{ value: "remove", label: "remove <branch>", description: "Remove worktree & delete branch" },
 		{ value: "rename", label: "rename <old> <new>", description: "Rename worktree branch" },
 		{ value: "switch", label: "switch <branch>", description: "Switch/attach to worktree" },
-		{ value: "rebase", label: "rebase [branch]", description: "Rebase topic worktree onto local main/master; Pi resolves conflicts" },
+		{ value: "rebase", label: "rebase [branch]", description: "Rebase local main/master onto topic worktree; Pi resolves conflicts" },
+		{ value: "tip", label: "tip [branch]", description: "Rebase topic worktree onto local main/master; Pi resolves conflicts" },
 		{ value: "pr", label: "pr [branch]", description: "Remote-base rebase, create PR with /skill:pr, and verify green CI" },
 		{ value: "help", label: "help", description: "Show help" },
 	];
@@ -1514,10 +1520,10 @@ async function getWorktreeArgumentCompletions(
 	const sub = parts[0].toLowerCase();
 	const subArg = parts[1] || "";
 
-	if (["remove", "rm", "delete", "switch", "attach", "rename", "rebase", "pr"].includes(sub) && gitRoot) {
+	if (["remove", "rm", "delete", "switch", "attach", "rename", "rebase", "tip", "pr"].includes(sub) && gitRoot) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const branchMatches = statuses
-			.filter((s) => (["rebase", "pr"].includes(sub) ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
+			.filter((s) => (["rebase", "tip", "pr"].includes(sub) ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
 			.map((s) => ({
 				value: `${sub} ${s.branch!}`,
 				label: s.branch!,
@@ -1551,7 +1557,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Primary command: /worktree
 	pi.registerCommand("worktree", {
-		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase, pr)",
+		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase, tip, pr)",
 		getArgumentCompletions: async (prefix) => {
 			const gitRoot = await getGitRoot(process.cwd());
 			return getWorktreeArgumentCompletions(prefix, gitRoot);
@@ -1590,6 +1596,9 @@ export default function (pi: ExtensionAPI) {
 					return;
 				case "rebase":
 					await handleRebaseCommand(route.args, ctx, route.gitRoot, pi);
+					return;
+				case "tip":
+					await handleRebaseCommand(route.args, ctx, route.gitRoot, pi, "tip");
 					return;
 				case "pr":
 					await handlePrCommand(route.args, ctx, route.gitRoot);

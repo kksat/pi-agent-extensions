@@ -96,6 +96,10 @@ assertEqual(routeWorktreeCommand("pr", "/repo"), { type: "pr", gitRoot: "/repo",
 assertEqual(routeWorktreeCommand("pr feature", "/repo"), { type: "pr", gitRoot: "/repo", args: "feature" }, "/worktree pr preserves the target branch");
 assertEqual(routeWorktreeCommand("pr", null), { type: "need-git" }, "/worktree pr requires a git repository");
 
+assertEqual(routeWorktreeCommand("tip", "/repo"), { type: "tip", gitRoot: "/repo", args: "" }, "/worktree tip routes independently from rebase");
+assertEqual(routeWorktreeCommand("tip feature", "/repo"), { type: "tip", gitRoot: "/repo", args: "feature" }, "/worktree tip preserves the topic branch");
+assertEqual(routeWorktreeCommand("tip", null), { type: "need-git" }, "/worktree tip requires a git repository");
+
 function session(partial: Partial<SessionInfo> & Pick<SessionInfo, "path">): SessionInfo {
 	return {
 		id: partial.id ?? partial.path,
