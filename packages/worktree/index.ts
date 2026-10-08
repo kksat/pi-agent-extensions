@@ -9,7 +9,7 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  * git worktrees running pi coding agents in tmux without prompts.
  *
  * Commands:
- *   /worktree [branch]                - Create worktree & run pi, or open the interactive menu if no args.
+ *   /worktree [branch]                - Create worktree & run pi, or open the fuzzy-search command menu if no args.
  *                                     Sessions is one menu choice. Inside a git repo it uses a /resume-style picker.
  *                                     Outside a git repo, that choice opens the usual session list.
  *   /worktree create <branch> [base]  - Create new worktree (optionally from base branch) & run pi
@@ -46,6 +46,7 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
+import { selectWorktreeCommand } from "./command-menu.ts";
 import { handleWorktreeRebase, isRebaseTarget } from "./rebase.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
 import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.ts";
@@ -1150,27 +1151,15 @@ function notifyNeedsGit(ctx: ExtensionCommandContext): void {
 }
 
 async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot: string | null, pi: ExtensionAPI): Promise<void> {
-	const choices = [
-		"➕ Create new worktree",
-		"📋 List all worktrees",
-		"💬 Browse sessions",
-		"🔀 Switch/attach to worktree",
-		"🔄 Rebase worktree onto main/master",
-		"✏️  Rename worktree branch",
-		"🗑️  Remove a worktree",
-		"🧹 Clean up all managed worktrees",
-		"❓ Help",
-	];
-
-	const selected = await ctx.ui.select("Worktree Management", choices);
+	const selected = await selectWorktreeCommand(ctx);
 	if (!selected) return;
 
-	if (selected.startsWith("💬")) {
+	if (selected === "sessions") {
 		if (gitRoot) await handleSessionsCommand(ctx, gitRoot);
 		else await handleFolderSessionsCommand(ctx);
 		return;
 	}
-	if (selected.startsWith("❓")) {
+	if (selected === "help") {
 		showHelp(ctx);
 		return;
 	}
@@ -1179,14 +1168,14 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		return;
 	}
 
-	if (selected.startsWith("➕")) {
+	if (selected === "create") {
 		const branch = await ctx.ui.input("Enter new branch name for worktree:");
 		if (!branch || !branch.trim()) return;
 		await handleCreateCommand(branch.trim(), ctx, gitRoot);
-	} else if (selected.startsWith("📋")) {
+	} else if (selected === "list") {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		ctx.ui.notify(formatWorktreeListText(statuses), "info");
-	} else if (selected.startsWith("🔀")) {
+	} else if (selected === "switch") {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
 		if (nonMain.length === 0) {
@@ -1200,9 +1189,9 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		if (branchChoice) {
 			await handleSwitchCommand(branchChoice, ctx, gitRoot);
 		}
-	} else if (selected.startsWith("🔄")) {
+	} else if (selected === "rebase") {
 		await handleRebaseCommand("", ctx, gitRoot, pi);
-	} else if (selected.startsWith("✏️")) {
+	} else if (selected === "rename") {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
 		if (nonMain.length === 0) {
@@ -1217,7 +1206,7 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		const newBranch = await ctx.ui.input(`Enter new name for branch "${oldBranch}":`);
 		if (!newBranch || !newBranch.trim()) return;
 		await handleRenameCommand(`${oldBranch} ${newBranch.trim()}`, ctx, gitRoot);
-	} else if (selected.startsWith("🗑️")) {
+	} else if (selected === "remove") {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
 		if (nonMain.length === 0) {
@@ -1231,7 +1220,7 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		if (branchToRemove) {
 			await handleRemoveCommand(branchToRemove, ctx, gitRoot);
 		}
-	} else if (selected.startsWith("🧹")) {
+	} else if (selected === "clean") {
 		await handleCleanCommand(ctx, gitRoot);
 	}
 }
@@ -1243,7 +1232,7 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree <branch>               Create worktree & run pi agent in tmux without prompt",
 		"  /worktree create <branch> [base] Create worktree from base branch & run pi in tmux",
 		"  /worktree list                   List all worktrees, managed status, and tmux state",
-		"  /worktree                        Interactive menu. Sessions is one choice, next to list and remove",
+		"  /worktree                        Searchable menu: type to fuzzy-search commands, then Enter to select",
 		"  /worktree sessions               Resume a session from a recorded worktree, even if it was removed",
 		"                                   Tab: current folder / all worktrees. Search, sort, filter by branch or worktree",
 		"                                   Outside a git repo, opens the usual session list",

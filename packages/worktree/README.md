@@ -13,7 +13,7 @@ Spin out new features, bugfixes, and experiments into isolated git worktrees run
 - **Easy cleanup**: safely kills tmux windows, removes git worktrees, and deletes topic branches with `/worktree clean`. Cleanup drops the active record and leaves the `known` path so its sessions stay reachable.
 - **Flexible management**: list, switch, rename, or remove individual worktrees.
 - **Rebase with Pi conflict resolution**: `/worktree rebase [branch]` rebases the current or selected topic worktree onto local `main`/`master`. If Git stops on conflicts, Pi automatically starts a turn to resolve them and continue the rebase.
-- **Interactive UI**: `/worktree` with no arguments opens an interactive menu. Sessions is one choice, next to list, remove, and the other worktree actions. Inside a git repository that choice uses the worktree session picker. Outside a git repository, it opens the usual session list.
+- **Searchable command menu**: `/worktree` with no arguments opens a focused search field above all worktree actions. Type a command name or description to fuzzy-filter and rank matches (for example, `rbs` finds rebase); use ↑/↓ to navigate, Enter to choose, and Escape to cancel. Clearing the search restores the full list. Sessions remains available inside and outside repositories. RPC clients retain the standard selection dialog.
 - **LLM tools**: exposes `worktree_create`, `worktree_list`, `worktree_clean`, `worktree_remove`, and `worktree_rename` to the agent.
 
 ## Install
@@ -34,7 +34,7 @@ pi install npm:pi-extension-worktree
 | Command | Description |
 |---|---|
 | `/worktree <branch> [base]` | Create a worktree & run pi in tmux |
-| `/worktree` | Interactive menu. Sessions is one choice |
+| `/worktree` | Searchable menu: type to fuzzy-search commands, ↑/↓ to navigate, Enter to select, Escape to cancel |
 | `/worktree list` · `/worktrees` | List worktrees with managed & tmux status |
 | `/worktree sessions` | Picker like `/resume`: current folder or all recorded worktrees, with search, sort, and branch/worktree filter. Resume in this folder or another. Outside a git repo, opens the usual session list |
 | `/worktree clean` · `/worktree-clean` | Remove all managed worktrees & branches |
@@ -57,6 +57,8 @@ pi install npm:pi-extension-worktree
 ```bash
 node --experimental-strip-types packages/worktree/test.ts
 node --experimental-strip-types packages/worktree/rebase.test.ts
+# Requires the package's Pi peer dependencies to be installed:
+node --experimental-strip-types packages/worktree/command-menu.test.ts
 ```
 
 ## Agent tools
