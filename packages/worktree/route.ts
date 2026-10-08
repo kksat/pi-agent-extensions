@@ -19,6 +19,7 @@ export type WorktreeRoute =
 	| { type: "rename"; gitRoot: string; args: string }
 	| { type: "switch"; gitRoot: string; args: string }
 	| { type: "rebase"; gitRoot: string; args: string }
+	| { type: "pr"; gitRoot: string; args: string }
 	| { type: "help" }
 	| { type: "create"; gitRoot: string; args: string };
 
@@ -68,6 +69,8 @@ export function routeWorktreeCommand(args: string, gitRoot: string | null): Work
 			return { type: "switch", gitRoot, args: rest };
 		case "rebase":
 			return { type: "rebase", gitRoot, args: rest };
+		case "pr":
+			return { type: "pr", gitRoot, args: rest };
 		case "help":
 		case "--help":
 		case "-h":

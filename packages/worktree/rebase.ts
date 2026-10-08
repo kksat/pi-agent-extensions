@@ -6,14 +6,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
-interface Worktree {
+export interface Worktree {
 	path: string;
 	branch?: string;
 	bare?: boolean;
 	prunable?: boolean;
 }
 
-interface GitResult {
+export interface GitResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number;
@@ -40,13 +40,29 @@ function isDefaultBranch(branch: string): boolean {
 	return branch === "main" || branch === "master";
 }
 
-async function hasGitMarker(deps: RebaseDependencies, cwd: string, marker: string): Promise<boolean> {
+async function hasGitMarker(deps: Pick<RebaseDependencies, "git">, cwd: string, marker: string): Promise<boolean> {
 	const result = await deps.git(["rev-parse", "--git-path", marker], cwd);
 	if (result.exitCode !== 0) throw new Error(result.stderr || "Cannot inspect worktree Git state.");
 	return fs.existsSync(path.resolve(cwd, result.stdout));
 }
 
-function shellQuote(value: string): string {
+export async function checkWorktreeReady(git: RebaseDependencies["git"], target: Worktree): Promise<string> {
+	const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], target.path);
+	if (head.exitCode !== 0 || head.stdout !== target.branch) throw new Error("Worktree branch changed. Select the worktree again.");
+	for (const marker of operationMarkers) {
+		if (await hasGitMarker({ git }, target.path, marker)) {
+			throw new Error("A rebase, merge, cherry-pick, or revert is already in progress in the target worktree. Finish or abort it first.");
+		}
+	}
+	const status = await git(["status", "--porcelain", "--untracked-files=all"], target.path);
+	if (status.exitCode !== 0) throw new Error(status.stderr || "Cannot read worktree status.");
+	if (status.stdout) throw new Error("Target worktree has uncommitted or untracked changes. Commit or stash them before rebasing.");
+	const original = await git(["rev-parse", "--verify", "HEAD"], target.path);
+	if (original.exitCode !== 0) throw new Error(original.stderr || "Cannot read the branch tip.");
+	return original.stdout;
+}
+
+export function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -138,18 +154,7 @@ export async function handleWorktreeRebase(
 		}
 		if (!base) throw new Error("No local main or master branch found. Fetch/update your base branch first.");
 
-		const head = await deps.git(["symbolic-ref", "--quiet", "--short", "HEAD"], target.path);
-		if (head.exitCode !== 0 || head.stdout !== branch) throw new Error("Worktree branch changed. Run /worktree rebase again.");
-		for (const marker of operationMarkers) {
-			if (await hasGitMarker(deps, target.path, marker)) {
-				throw new Error("A rebase, merge, cherry-pick, or revert is already in progress in the target worktree. Finish or abort it first.");
-			}
-		}
-		const status = await deps.git(["status", "--porcelain", "--untracked-files=all"], target.path);
-		if (status.exitCode !== 0) throw new Error(status.stderr || "Cannot read worktree status.");
-		if (status.stdout) throw new Error("Target worktree has uncommitted or untracked changes. Commit or stash them before rebasing.");
-		const original = await deps.git(["rev-parse", "--verify", "HEAD"], target.path);
-		if (original.exitCode !== 0) throw new Error(original.stderr || "Cannot read the branch tip.");
+		const original = await checkWorktreeReady(deps.git, target);
 
 		ctx.ui.notify(`Rebasing ${JSON.stringify(branch)} onto local ${base} in ${target.path}...`, "info");
 		// Pin the base commit, disable implicit stashing and updates to other branch refs.
@@ -161,7 +166,7 @@ export async function handleWorktreeRebase(
 		const inRebase = await hasGitMarker(deps, target.path, "rebase-merge") || await hasGitMarker(deps, target.path, "rebase-apply");
 		const unmerged = await deps.git(["diff", "--name-only", "--diff-filter=U"], target.path);
 		if (inRebase && unmerged.exitCode === 0 && unmerged.stdout) {
-			deps.sendUserMessage(conflictPrompt(target, base, original.stdout, onto));
+			deps.sendUserMessage(conflictPrompt(target, base, original, onto));
 			ctx.ui.notify("Rebase conflicts found. Pi will resolve them and continue the rebase.", "warning");
 			return;
 		}

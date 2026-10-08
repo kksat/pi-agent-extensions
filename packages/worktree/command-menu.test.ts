@@ -31,7 +31,7 @@ function fixture(t: TestContext, bindings: KeybindingsConfig = {}) {
 		onSelect: (command) => { selected.push(command); },
 		onCancel: () => { cancelled++; },
 		requestRender: () => { renders++; },
-		maxVisible: 9,
+		maxVisible: 10,
 	});
 	menu.focused = true;
 	return { menu, selected, cancelled: () => cancelled, renders: () => renders };
@@ -50,7 +50,7 @@ function text(menu: WorktreeCommandMenu): string {
 
 test("blank menu shows every command and still supports selection without typing", (t) => {
 	const f = fixture(t);
-	for (const label of ["Create", "List", "Browse sessions", "Switch", "Rebase", "Rename", "Remove", "Clean", "Help"]) {
+	for (const label of ["Create", "List", "Browse sessions", "Switch", "Rebase", "Create PR", "Rename", "Remove", "Clean", "Help"]) {
 		assert.ok(text(f.menu).includes(label), label);
 	}
 	f.menu.handleInput(down);
@@ -79,7 +79,7 @@ test("search is case-insensitive and matches descriptive words", (t) => {
 
 test("complete command names select the correct action", (t) => {
 	const f = fixture(t);
-	for (const command of ["create", "list", "sessions", "switch", "rebase", "rename", "remove", "clean", "help"]) {
+	for (const command of ["create", "list", "sessions", "switch", "rebase", "pr", "rename", "remove", "clean", "help"]) {
 		f.menu.handleInput(clear);
 		f.menu.handleInput(command);
 		f.menu.handleInput(enter);

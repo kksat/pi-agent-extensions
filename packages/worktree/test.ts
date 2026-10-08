@@ -92,6 +92,10 @@ assertEqual(
 );
 assertEqual(routeWorktreeCommand("rebase", null), { type: "need-git" }, "rebase requires a git repository");
 
+assertEqual(routeWorktreeCommand("pr", "/repo"), { type: "pr", gitRoot: "/repo", args: "" }, "/worktree pr opens the PR workflow, not branch creation");
+assertEqual(routeWorktreeCommand("pr feature", "/repo"), { type: "pr", gitRoot: "/repo", args: "feature" }, "/worktree pr preserves the target branch");
+assertEqual(routeWorktreeCommand("pr", null), { type: "need-git" }, "/worktree pr requires a git repository");
+
 function session(partial: Partial<SessionInfo> & Pick<SessionInfo, "path">): SessionInfo {
 	return {
 		id: partial.id ?? partial.path,

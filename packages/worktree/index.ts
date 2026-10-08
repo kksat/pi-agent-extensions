@@ -22,6 +22,7 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  *   /worktree rename [old] [new]      - Rename a worktree's branch
  *   /worktree switch [branch]         - Switch/attach to a worktree's tmux window or session
  *   /worktree rebase [branch]         - Rebase current/selected topic worktree onto local main/master; Pi resolves conflicts
+ *   /worktree pr [branch]             - Select a worktree, rebase onto remote main/master, create PR, and ensure green CI
  *   /worktree help                    - Show worktree command help
  *
  * Also provides alias shortcuts:
@@ -48,6 +49,7 @@ import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
 import { selectWorktreeCommand } from "./command-menu.ts";
 import { handleWorktreeRebase, isRebaseTarget } from "./rebase.ts";
+import { WorktreePrWorkflow } from "./pr.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
 import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.ts";
 
@@ -1150,7 +1152,12 @@ function notifyNeedsGit(ctx: ExtensionCommandContext): void {
 	ctx.ui.notify("Current directory is not inside a git repository.", "error");
 }
 
-async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot: string | null, pi: ExtensionAPI): Promise<void> {
+async function showInteractiveWorktreeMenu(
+	ctx: ExtensionCommandContext,
+	gitRoot: string | null,
+	pi: ExtensionAPI,
+	handlePrCommand: (args: string, ctx: ExtensionCommandContext, root: string) => Promise<void>,
+): Promise<void> {
 	const selected = await selectWorktreeCommand(ctx);
 	if (!selected) return;
 
@@ -1191,6 +1198,8 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		}
 	} else if (selected === "rebase") {
 		await handleRebaseCommand("", ctx, gitRoot, pi);
+	} else if (selected === "pr") {
+		await handlePrCommand("", ctx, gitRoot);
 	} else if (selected === "rename") {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
@@ -1242,6 +1251,8 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree switch [branch]        Switch/attach to worktree's tmux window/session",
 		"  /worktree rebase [branch]        Rebase current topic worktree onto local main/master",
 		"                                   On main/master: select a worktree. Pi resolves conflicts",
+		"  /worktree pr [branch]            Select a topic worktree, rebase onto remote main/master, create PR",
+		"                                   Use /skill:pr for the body; repair failures until CI is verified green",
 		"  /worktree help                   Show this help message",
 		"",
 		"💡 Shorthand aliases: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
@@ -1472,6 +1483,7 @@ async function getWorktreeArgumentCompletions(
 		{ value: "rename", label: "rename <old> <new>", description: "Rename worktree branch" },
 		{ value: "switch", label: "switch <branch>", description: "Switch/attach to worktree" },
 		{ value: "rebase", label: "rebase [branch]", description: "Rebase topic worktree onto local main/master; Pi resolves conflicts" },
+		{ value: "pr", label: "pr [branch]", description: "Remote-base rebase, create PR with /skill:pr, and verify green CI" },
 		{ value: "help", label: "help", description: "Show help" },
 	];
 
@@ -1502,10 +1514,10 @@ async function getWorktreeArgumentCompletions(
 	const sub = parts[0].toLowerCase();
 	const subArg = parts[1] || "";
 
-	if (["remove", "rm", "delete", "switch", "attach", "rename", "rebase"].includes(sub) && gitRoot) {
+	if (["remove", "rm", "delete", "switch", "attach", "rename", "rebase", "pr"].includes(sub) && gitRoot) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const branchMatches = statuses
-			.filter((s) => (sub === "rebase" ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
+			.filter((s) => (["rebase", "pr"].includes(sub) ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
 			.map((s) => ({
 				value: `${sub} ${s.branch!}`,
 				label: s.branch!,
@@ -1522,14 +1534,24 @@ async function getWorktreeArgumentCompletions(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	// Synchronize session entries
-	pi.on("session_start", async (_event, ctx) => {
-		// Session start lifecycle
+	const prWorkflow = new WorktreePrWorkflow({
+		run: (command, args, cwd) => exec(command, args, cwd),
+		getWorktrees: getGitWorktrees,
+		sendUserMessage: (prompt) => pi.sendUserMessage(prompt, { deliverAs: "followUp" }),
 	});
+	const handlePrCommand = async (args: string, ctx: ExtensionCommandContext, root: string) => {
+		await prWorkflow.start(args, ctx, root);
+	};
+	pi.on("session_start", () => prWorkflow.reset());
+	pi.on("session_switch", () => prWorkflow.reset());
+	pi.on("session_fork", () => prWorkflow.reset());
+	pi.on("session_tree", () => prWorkflow.reset());
+	pi.on("session_shutdown", () => prWorkflow.reset());
+	pi.on("agent_before_settle", (event) => prWorkflow.beforeSettle(event.outcome, event.continue));
 
 	// Primary command: /worktree
 	pi.registerCommand("worktree", {
-		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase)",
+		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase, pr)",
 		getArgumentCompletions: async (prefix) => {
 			const gitRoot = await getGitRoot(process.cwd());
 			return getWorktreeArgumentCompletions(prefix, gitRoot);
@@ -1546,7 +1568,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Current directory is not inside a git repository.", "error");
 					return;
 				case "menu":
-					await showInteractiveWorktreeMenu(ctx, route.gitRoot, pi);
+					await showInteractiveWorktreeMenu(ctx, route.gitRoot, pi, handlePrCommand);
 					return;
 				case "list":
 					await handleListCommand(ctx, route.gitRoot);
@@ -1568,6 +1590,9 @@ export default function (pi: ExtensionAPI) {
 					return;
 				case "rebase":
 					await handleRebaseCommand(route.args, ctx, route.gitRoot, pi);
+					return;
+				case "pr":
+					await handlePrCommand(route.args, ctx, route.gitRoot);
 					return;
 				case "help":
 					showHelp(ctx);
@@ -1625,6 +1650,20 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await handleRenameCommand(args, ctx, gitRoot);
+		},
+	});
+
+	pi.registerTool({
+		name: "worktree_pr_pause",
+		label: "Pause PR Workflow",
+		description: "Pause an active /worktree pr workflow when blocked or awaiting user input. Does not mark CI green or undo Git/PR changes.",
+		parameters: Type.Object({
+			reason: Type.String({ minLength: 1, description: "Concrete blocker requiring user input, credentials, or an unsafe/ambiguous repair" }),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			const message = prWorkflow.pause(params.reason);
+			ctx.ui.notify(message, "warning");
+			return { content: [{ type: "text", text: message }], details: { status: "paused", reason: params.reason } };
 		},
 	});
 

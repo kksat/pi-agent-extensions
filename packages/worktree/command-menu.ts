@@ -25,6 +25,7 @@ const commands: SelectItem[] = [
 	{ value: "sessions", label: "💬 Browse sessions" },
 	{ value: "switch", label: "🔀 Switch/attach to worktree" },
 	{ value: "rebase", label: "🔄 Rebase worktree onto main/master" },
+	{ value: "pr", label: "📤 Create PR and ensure green CI" },
 	{ value: "rename", label: "✏️  Rename worktree branch" },
 	{ value: "remove", label: "🗑️  Remove a worktree" },
 	{ value: "clean", label: "🧹 Clean up all managed worktrees" },
