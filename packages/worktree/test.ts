@@ -80,6 +80,18 @@ assertEqual(
 	"/worktree create keeps only the arguments after the subcommand",
 );
 
+assertEqual(
+	routeWorktreeCommand("rebase", "/repo"),
+	{ type: "rebase", gitRoot: "/repo", args: "" },
+	"/worktree rebase routes to rebase, not branch creation",
+);
+assertEqual(
+	routeWorktreeCommand("rebase feature", "/repo"),
+	{ type: "rebase", gitRoot: "/repo", args: "feature" },
+	"/worktree rebase preserves the selected branch",
+);
+assertEqual(routeWorktreeCommand("rebase", null), { type: "need-git" }, "rebase requires a git repository");
+
 function session(partial: Partial<SessionInfo> & Pick<SessionInfo, "path">): SessionInfo {
 	return {
 		id: partial.id ?? partial.path,

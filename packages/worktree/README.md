@@ -12,6 +12,7 @@ Spin out new features, bugfixes, and experiments into isolated git worktrees run
 - **Sessions across worktrees**: `/worktree sessions` opens a picker like `/resume`, starting with every recorded worktree, including checkouts that no longer exist. Tab switches to the current folder. Search matches the session text, branch, and worktree name (`branch:` and `worktree:` limit a token; Ctrl+Shift+B cycles the field). Sort and the named-session filter use the same keys as `/resume`. Choosing a session forks it into the current folder or another living directory when that folder is not already the session's directory. `git worktree list` is used only when nothing has been written down yet. Outside a git repository, the same command opens the usual session list.
 - **Easy cleanup**: safely kills tmux windows, removes git worktrees, and deletes topic branches with `/worktree clean`. Cleanup drops the active record and leaves the `known` path so its sessions stay reachable.
 - **Flexible management**: list, switch, rename, or remove individual worktrees.
+- **Rebase with Pi conflict resolution**: `/worktree rebase [branch]` rebases the current or selected topic worktree onto local `main`/`master`. If Git stops on conflicts, Pi automatically starts a turn to resolve them and continue the rebase.
 - **Interactive UI**: `/worktree` with no arguments opens an interactive menu. Sessions is one choice, next to list, remove, and the other worktree actions. Inside a git repository that choice uses the worktree session picker. Outside a git repository, it opens the usual session list.
 - **LLM tools**: exposes `worktree_create`, `worktree_list`, `worktree_clean`, `worktree_remove`, and `worktree_rename` to the agent.
 
@@ -40,7 +41,23 @@ pi install npm:pi-extension-worktree
 | `/worktree remove [branch]` · `/worktree-remove` | Remove one worktree |
 | `/worktree rename <old> <new>` · `/worktree-rename` | Rename a branch |
 | `/worktree switch [branch]` | Switch / attach to its tmux window |
+| `/worktree rebase [branch]` | Rebase the current topic worktree onto local `main`/`master`; on `main`/`master`, select a worktree. Pi resolves conflicts |
 | `/worktree help` | Show help |
+
+## Rebasing
+
+- In a topic worktree (including a subdirectory), `/worktree rebase` runs the rebase there.
+- On `main` or `master`, `/worktree rebase` opens a topic-worktree picker. `/worktree rebase <branch>` explicitly targets an existing worktree from any checkout. Managed and unmanaged worktrees are supported; the main repository checkout is eligible if it is on a topic branch.
+- This replays the **topic branch onto the base**, not `main`/`master` onto the topic. The invoking `main`/`master` is preferred; from a topic branch, `main` is preferred, with `master` as fallback. Only local base commits are used: update your base first if you want remote changes. The command does not fetch or push.
+- The target must be clean, including untracked files, with no rebase/merge/cherry-pick/revert already in progress. Busy agents and detached HEAD without an explicit target are rejected. No automatic stashing or updates to other branch refs are performed.
+- Conflicts trigger a prompt in the invoking Pi session, scoped to the selected worktree's absolute path. Pi inspects each conflicted commit, resolves and stages the affected files, continues with a noninteractive editor, and verifies completion. Ambiguous resolutions or non-conflict failures require user input; the rebase is left recoverable. Do not run another agent or edit the target worktree while rebasing. Cancelling the Pi turn leaves the rebase paused; resume resolution or run `git -C <worktree-path> rebase --abort` yourself.
+
+## Tests
+
+```bash
+node --experimental-strip-types packages/worktree/test.ts
+node --experimental-strip-types packages/worktree/rebase.test.ts
+```
 
 ## Agent tools
 

@@ -21,6 +21,7 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  *   /worktree remove [branch]         - Remove a specific worktree and delete its branch
  *   /worktree rename [old] [new]      - Rename a worktree's branch
  *   /worktree switch [branch]         - Switch/attach to a worktree's tmux window or session
+ *   /worktree rebase [branch]         - Rebase current/selected topic worktree onto local main/master; Pi resolves conflicts
  *   /worktree help                    - Show worktree command help
  *
  * Also provides alias shortcuts:
@@ -45,6 +46,7 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
+import { handleWorktreeRebase, isRebaseTarget } from "./rebase.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
 import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.ts";
 
@@ -1147,12 +1149,13 @@ function notifyNeedsGit(ctx: ExtensionCommandContext): void {
 	ctx.ui.notify("Current directory is not inside a git repository.", "error");
 }
 
-async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot: string | null): Promise<void> {
+async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot: string | null, pi: ExtensionAPI): Promise<void> {
 	const choices = [
 		"➕ Create new worktree",
 		"📋 List all worktrees",
 		"💬 Browse sessions",
 		"🔀 Switch/attach to worktree",
+		"🔄 Rebase worktree onto main/master",
 		"✏️  Rename worktree branch",
 		"🗑️  Remove a worktree",
 		"🧹 Clean up all managed worktrees",
@@ -1197,6 +1200,8 @@ async function showInteractiveWorktreeMenu(ctx: ExtensionCommandContext, gitRoot
 		if (branchChoice) {
 			await handleSwitchCommand(branchChoice, ctx, gitRoot);
 		}
+	} else if (selected.startsWith("🔄")) {
+		await handleRebaseCommand("", ctx, gitRoot, pi);
 	} else if (selected.startsWith("✏️")) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
@@ -1246,6 +1251,8 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree remove [branch]        Remove specific worktree and delete branch",
 		"  /worktree rename <old> <new>     Rename worktree branch",
 		"  /worktree switch [branch]        Switch/attach to worktree's tmux window/session",
+		"  /worktree rebase [branch]        Rebase current topic worktree onto local main/master",
+		"                                   On main/master: select a worktree. Pi resolves conflicts",
 		"  /worktree help                   Show this help message",
 		"",
 		"💡 Shorthand aliases: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
@@ -1257,6 +1264,14 @@ function showHelp(ctx: ExtensionContext): void {
 // ---------------------------------------------------------------------------
 // Command Handlers
 // ---------------------------------------------------------------------------
+
+async function handleRebaseCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string, pi: ExtensionAPI): Promise<void> {
+	await handleWorktreeRebase(args, ctx, gitRoot, {
+		git: (gitArgs, cwd) => exec("git", gitArgs, cwd),
+		getWorktrees: getGitWorktrees,
+		sendUserMessage: (prompt) => pi.sendUserMessage(prompt, { deliverAs: "followUp" }),
+	});
+}
 
 async function handleCreateCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
 	const parts = args.trim().split(/\s+/);
@@ -1467,6 +1482,7 @@ async function getWorktreeArgumentCompletions(
 		{ value: "remove", label: "remove <branch>", description: "Remove worktree & delete branch" },
 		{ value: "rename", label: "rename <old> <new>", description: "Rename worktree branch" },
 		{ value: "switch", label: "switch <branch>", description: "Switch/attach to worktree" },
+		{ value: "rebase", label: "rebase [branch]", description: "Rebase topic worktree onto local main/master; Pi resolves conflicts" },
 		{ value: "help", label: "help", description: "Show help" },
 	];
 
@@ -1497,10 +1513,10 @@ async function getWorktreeArgumentCompletions(
 	const sub = parts[0].toLowerCase();
 	const subArg = parts[1] || "";
 
-	if (["remove", "rm", "delete", "switch", "attach", "rename"].includes(sub) && gitRoot) {
+	if (["remove", "rm", "delete", "switch", "attach", "rename", "rebase"].includes(sub) && gitRoot) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const branchMatches = statuses
-			.filter((s) => !s.isMain && s.branch && s.branch.startsWith(subArg))
+			.filter((s) => (sub === "rebase" ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
 			.map((s) => ({
 				value: `${sub} ${s.branch!}`,
 				label: s.branch!,
@@ -1524,7 +1540,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Primary command: /worktree
 	pi.registerCommand("worktree", {
-		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch)",
+		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase)",
 		getArgumentCompletions: async (prefix) => {
 			const gitRoot = await getGitRoot(process.cwd());
 			return getWorktreeArgumentCompletions(prefix, gitRoot);
@@ -1541,7 +1557,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Current directory is not inside a git repository.", "error");
 					return;
 				case "menu":
-					await showInteractiveWorktreeMenu(ctx, route.gitRoot);
+					await showInteractiveWorktreeMenu(ctx, route.gitRoot, pi);
 					return;
 				case "list":
 					await handleListCommand(ctx, route.gitRoot);
@@ -1560,6 +1576,9 @@ export default function (pi: ExtensionAPI) {
 					return;
 				case "switch":
 					await handleSwitchCommand(route.args, ctx, route.gitRoot);
+					return;
+				case "rebase":
+					await handleRebaseCommand(route.args, ctx, route.gitRoot, pi);
 					return;
 				case "help":
 					showHelp(ctx);
