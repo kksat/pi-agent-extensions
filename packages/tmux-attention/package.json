@@ -1,0 +1,33 @@
+{
+	"name": "pi-extension-tmux-attention",
+	"version": "0.1.0",
+	"description": "pi extension: mark tmux window names when the agent needs attention and clear them on selection or focus",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"tmux",
+		"attention",
+		"notify"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/tmux-attention"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"test": "node --test test.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}
