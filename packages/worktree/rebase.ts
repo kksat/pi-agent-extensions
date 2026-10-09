@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { selectWorktree, type PickerContext } from "./worktree-picker.ts";
 
 export interface Worktree {
 	path: string;
@@ -26,8 +27,8 @@ interface RebaseDependencies {
 	sendUserMessage(prompt: string): void;
 }
 
-type RebaseContext = Pick<ExtensionCommandContext, "cwd" | "hasUI" | "isIdle"> & {
-	ui: Pick<ExtensionCommandContext["ui"], "notify" | "select">;
+type RebaseContext = PickerContext & Pick<ExtensionCommandContext, "cwd" | "hasUI" | "isIdle"> & {
+	ui: Pick<ExtensionCommandContext["ui"], "notify">;
 };
 
 type RebaseCommand = "rebase" | "tip";
@@ -148,7 +149,7 @@ async function handleDirectionalRebase(
 				return;
 			}
 			const title = command === "rebase" ? "Select worktree to rebase main/master onto:" : "Select worktree to tip onto main/master:";
-			const chosen = await ctx.ui.select(title, topics.map((wt) => wt.branch!));
+			const chosen = await selectWorktree(ctx, title, topics);
 			if (!chosen) return;
 			branch = chosen;
 		} else {

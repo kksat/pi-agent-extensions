@@ -58,10 +58,12 @@ function fixture(t: TestContext, base = "main") {
 		const commands: Array<{ args: string[]; cwd: string }> = [];
 		const handler = options.command === "rebase" ? handleWorktreeRebase : handleWorktreeTip;
 		await handler(args, {
+			mode: "rpc",
 			cwd,
 			hasUI: options.hasUI ?? true,
 			isIdle: () => options.idle ?? true,
 			ui: {
+				custom: async () => { throw new Error("RPC must not open terminal UI"); },
 				notify: (text, level) => { notices.push({ text, level }); },
 				select: async (_title, choices) => {
 					selections.push(choices);

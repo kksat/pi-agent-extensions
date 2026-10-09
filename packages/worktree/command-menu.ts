@@ -42,24 +42,32 @@ interface MenuOptions {
 	maxVisible?: number;
 }
 
-/** A searchable command palette: typing ranks fuzzy matches; Enter executes only a selected command. */
-export class WorktreeCommandMenu implements Component, Focusable {
+interface SearchableMenuOptions extends MenuOptions {
+	title: string;
+	items: SelectItem[];
+	placeholder: string;
+	emptyMessage?: string;
+}
+
+/** Typing ranks fuzzy matches; Enter returns only the highlighted item's original value. */
+export class SearchableMenu implements Component, Focusable {
 	private search: Input;
 	private list: SelectList;
-	private items = commands;
+	private items: SelectItem[];
 	private border: DynamicBorder;
 	private maxVisible: number;
-	private options: MenuOptions;
+	private options: SearchableMenuOptions;
 	private pasting = false;
 	private query = "";
 
-	constructor(options: MenuOptions) {
+	constructor(options: SearchableMenuOptions) {
 		this.options = options;
-		this.maxVisible = Math.max(1, options.maxVisible ?? commands.length);
+		this.items = options.items;
+		this.maxVisible = Math.max(1, options.maxVisible ?? options.items.length);
 		this.border = new DynamicBorder((text) => options.theme.fg("accent", text));
 		this.search = new Input({
 			prompt: "Search: ",
-			placeholder: "Type a command…",
+			placeholder: options.placeholder,
 			placeholderStyle: (text) => options.theme.fg("dim", text),
 		});
 		this.search.onSubmit = () => {
@@ -85,7 +93,7 @@ export class WorktreeCommandMenu implements Component, Focusable {
 			selectedText: (text) => theme.fg("accent", text),
 			description: (text) => theme.fg("muted", text),
 			scrollInfo: (text) => theme.fg("dim", text),
-			noMatch: (text) => theme.fg("warning", text),
+			noMatch: (text) => theme.fg("warning", this.options.emptyMessage ?? text),
 		});
 	}
 
@@ -97,7 +105,7 @@ export class WorktreeCommandMenu implements Component, Focusable {
 	private refreshMatches(): void {
 		if (this.search.getValue() === this.query) return;
 		this.query = this.search.getValue();
-		this.items = fuzzyFilter(commands, this.query, (item) => `${item.value} ${item.label}`);
+		this.items = fuzzyFilter(this.options.items, this.query, (item) => `${item.value} ${item.label} ${item.description ?? ""}`);
 		// SelectList.setFilter is prefix-only; rebuilding retains fuzzy ranking and selects the best match.
 		this.list = this.createList();
 	}
@@ -145,7 +153,7 @@ export class WorktreeCommandMenu implements Component, Focusable {
 		].join(" · ");
 		return [
 			...this.border.render(width),
-			theme.fg("accent", theme.bold("Worktree Management")),
+			theme.fg("accent", theme.bold(this.options.title)),
 			...this.search.render(width),
 			"",
 			...this.list.render(width),
@@ -159,6 +167,12 @@ export class WorktreeCommandMenu implements Component, Focusable {
 		this.search.invalidate();
 		this.list.invalidate();
 		this.border.invalidate();
+	}
+}
+
+export class WorktreeCommandMenu extends SearchableMenu {
+	constructor(options: MenuOptions) {
+		super({ ...options, title: "Worktree Management", items: commands, placeholder: "Type a command…" });
 	}
 }
 

@@ -49,6 +49,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
 import { selectWorktreeCommand } from "./command-menu.ts";
+import { selectSearchableItem, selectWorktree } from "./worktree-picker.ts";
 import { handleWorktreeRebase, handleWorktreeTip, isRebaseTarget } from "./rebase.ts";
 import { WorktreePrWorkflow } from "./pr.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
@@ -1051,7 +1052,8 @@ async function handleSessionsCommand(ctx: ExtensionCommandContext, gitRoot: stri
 
 	const destinations = await listResumeDestinations(gitRoot, ctx.cwd);
 	const destinationLabels = [...destinations.map((choice) => choice.label), OTHER_FOLDER_CHOICE];
-	const destinationChoice = await ctx.ui.select(`Resume "${picked.branch}" in:`, destinationLabels);
+	const destinationChoice = await selectSearchableItem(ctx, `Resume "${picked.branch}" in:`,
+		destinationLabels.map((label) => ({ value: label, label })));
 	if (!destinationChoice) return;
 
 	let destination = destinations.find((choice) => choice.label === destinationChoice)?.path;
@@ -1213,10 +1215,7 @@ async function showInteractiveWorktreeMenu(
 			ctx.ui.notify("No other worktrees available to switch to", "warning");
 			return;
 		}
-		const branchChoice = await ctx.ui.select(
-			"Select worktree to switch to:",
-			nonMain.map((s) => s.branch!),
-		);
+		const branchChoice = await selectWorktree(ctx, "Select worktree to switch to:", nonMain);
 		if (branchChoice) {
 			await handleSwitchCommand(branchChoice, ctx, gitRoot);
 		}
@@ -1233,10 +1232,7 @@ async function showInteractiveWorktreeMenu(
 			ctx.ui.notify("No worktrees available to rename", "warning");
 			return;
 		}
-		const oldBranch = await ctx.ui.select(
-			"Select branch to rename:",
-			nonMain.map((s) => s.branch!),
-		);
+		const oldBranch = await selectWorktree(ctx, "Select branch to rename:", nonMain);
 		if (!oldBranch) return;
 		const newBranch = await ctx.ui.input(`Enter new name for branch "${oldBranch}":`);
 		if (!newBranch || !newBranch.trim()) return;
@@ -1248,10 +1244,7 @@ async function showInteractiveWorktreeMenu(
 			ctx.ui.notify("No worktrees available to remove", "warning");
 			return;
 		}
-		const branchToRemove = await ctx.ui.select(
-			"Select worktree to remove:",
-			nonMain.map((s) => s.branch!),
-		);
+		const branchToRemove = await selectWorktree(ctx, "Select worktree to remove:", nonMain);
 		if (branchToRemove) {
 			await handleRemoveCommand(branchToRemove, ctx, gitRoot);
 		}
@@ -1282,6 +1275,7 @@ function showHelp(ctx: ExtensionContext): void {
 		"                                   Use /skill:pr for the body; repair failures until CI is verified green",
 		"  /worktree help                   Show this help message",
 		"",
+		"💡 Worktree pickers: type to fuzzy-search branches or paths; ↑/↓ select, Enter confirms, Escape cancels",
 		"💡 Shorthand aliases: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
 	].join("\n");
 
@@ -1382,10 +1376,7 @@ async function handleRemoveCommand(args: string, ctx: ExtensionCommandContext, g
 			ctx.ui.notify("No worktrees available to remove.", "warning");
 			return;
 		}
-		const chosen = await ctx.ui.select(
-			"Select worktree to remove:",
-			nonMain.map((s) => s.branch!),
-		);
+		const chosen = await selectWorktree(ctx, "Select worktree to remove:", nonMain);
 		if (!chosen) return;
 		branch = chosen;
 	}
@@ -1423,10 +1414,7 @@ async function handleRenameCommand(args: string, ctx: ExtensionCommandContext, g
 		}
 
 		if (!oldBranch) {
-			const chosen = await ctx.ui.select(
-				"Select branch to rename:",
-				nonMain.map((s) => s.branch!),
-			);
+			const chosen = await selectWorktree(ctx, "Select branch to rename:", nonMain);
 			if (!chosen) return;
 			oldBranch = chosen;
 		}
@@ -1457,10 +1445,7 @@ async function handleSwitchCommand(args: string, ctx: ExtensionCommandContext, g
 			ctx.ui.notify("No worktrees available.", "warning");
 			return;
 		}
-		const chosen = await ctx.ui.select(
-			"Select worktree to switch to:",
-			nonMain.map((s) => s.branch!),
-		);
+		const chosen = await selectWorktree(ctx, "Select worktree to switch to:", nonMain);
 		if (!chosen) return;
 		branch = chosen;
 	}

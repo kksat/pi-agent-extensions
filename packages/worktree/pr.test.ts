@@ -128,9 +128,11 @@ function fixture(t: TestContext, options: {
 	});
 	async function start(args = "", ui: { hasUI?: boolean; idle?: boolean; chosen?: string; cancel?: boolean } = {}) {
 		await workflow.start(args, {
+			mode: "rpc",
 			hasUI: ui.hasUI ?? true,
 			isIdle: () => ui.idle ?? true,
 			ui: {
+				custom: async () => { throw new Error("RPC must not open terminal UI"); },
 				notify: (text, level) => { notices.push({ text, level }); },
 				select: async (_title, choices) => {
 					selections.push(choices);

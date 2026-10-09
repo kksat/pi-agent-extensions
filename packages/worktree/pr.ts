@@ -4,9 +4,10 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
 
 import type { BoundaryResult, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { checkWorktreeReady, isRebaseTarget, shellQuote, type GitResult, type Worktree } from "./rebase.ts";
+import { selectWorktree, type PickerContext } from "./worktree-picker.ts";
 
-type PrContext = Pick<ExtensionCommandContext, "hasUI" | "isIdle"> & {
-	ui: Pick<ExtensionCommandContext["ui"], "notify" | "select">;
+type PrContext = PickerContext & Pick<ExtensionCommandContext, "hasUI" | "isIdle"> & {
+	ui: Pick<ExtensionCommandContext["ui"], "notify">;
 };
 
 interface PrDependencies {
@@ -149,7 +150,7 @@ export class WorktreePrWorkflow {
 			if (!branch) {
 				if (!targets.length) throw new Error("No topic worktrees available for a PR.");
 				if (!ctx.hasUI) throw new Error("Specify a worktree branch: /worktree pr <branch>.");
-				branch = await ctx.ui.select("Select worktree to create a PR from:", targets.map((wt) => wt.branch!)) ?? "";
+				branch = await selectWorktree(ctx, "Select worktree to create a PR from:", targets) ?? "";
 				if (!branch) return;
 			}
 			const target = targets.find((wt) => wt.branch === branch);
