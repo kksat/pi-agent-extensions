@@ -13,7 +13,7 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  *                                     Sessions is one menu choice. Inside a git repo it uses a /resume-style picker.
  *                                     Outside a git repo, that choice opens the usual session list.
  *   /worktree create <branch> [base]  - Create new worktree (optionally from base branch) & run pi
- *   /worktree list                    - List all worktrees with managed & tmux status
+ *   /worktree list                    - Interactive worktree list with configurable Vim-style action keys
  *   /worktree sessions                - Resume a session from any recorded worktree, even if that checkout is gone.
  *                                     Tab switches the current folder and all recorded worktrees. Search, sort,
  *                                     and filter by branch or worktree name. Outside a git repo, opens the usual session list.
@@ -53,6 +53,7 @@ import { routeWorktreeCommand } from "./route.ts";
 import { loadWorktreeAliases, registerWorktreeCommands, resolveWorktreeSubcommand, type SubcommandAliases } from "./aliases.ts";
 import { selectWorktreeCommand } from "./command-menu.ts";
 import { selectSearchableItem, selectWorktree } from "./worktree-picker.ts";
+import { browseWorktrees } from "./worktree-list.ts";
 import { handleWorktreeRebase, handleWorktreeTip, isRebaseTarget } from "./rebase.ts";
 import { WorktreePrWorkflow } from "./pr.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
@@ -1209,8 +1210,7 @@ async function showInteractiveWorktreeMenu(
 		if (!branch || !branch.trim()) return;
 		await handleCreateCommand(branch.trim(), ctx, gitRoot);
 	} else if (selected === "list") {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		ctx.ui.notify(formatWorktreeListText(statuses), "info");
+		await handleListCommand(ctx, gitRoot, pi, handlePrCommand);
 	} else if (selected === "switch") {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
@@ -1262,7 +1262,10 @@ function showHelp(ctx: ExtensionContext): void {
 		"",
 		"  /worktree <branch>               Create worktree & run pi agent in tmux without prompt",
 		"  /worktree create <branch> [base] Create worktree from base branch & run pi in tmux",
-		"  /worktree list                   List all worktrees, managed status, and tmux state",
+		"  /worktree list                   Interactive list: j/k navigate, / search, q close",
+		"                                   x remove, n rename, r rebase, t tip, p PR, Enter/w switch",
+		"                                   c create, l refresh, s sessions, Shift+C clean, ? help",
+		"                                   Configure worktree.list.* actions in agent keybindings.json",
 		"  /worktree                        Searchable menu: type to fuzzy-search commands, then Enter to select",
 		"  /worktree sessions               Resume a session from a recorded worktree, even if it was removed",
 		"                                   Tab: current folder / all worktrees. Search, sort, filter by branch or worktree",
@@ -1329,9 +1332,36 @@ async function handleCreateCommand(args: string, ctx: ExtensionCommandContext, g
 	ctx.ui.notify(msg, "info");
 }
 
-async function handleListCommand(ctx: ExtensionContext, gitRoot: string): Promise<void> {
-	const statuses = await getAllWorktreeStatuses(gitRoot);
-	ctx.ui.notify(formatWorktreeListText(statuses), "info");
+async function handleListCommand(
+	ctx: ExtensionCommandContext,
+	gitRoot: string,
+	pi: ExtensionAPI,
+	handlePrCommand: (args: string, ctx: ExtensionCommandContext, root: string) => Promise<void>,
+): Promise<void> {
+	if (ctx.mode !== "tui") {
+		ctx.ui.notify(formatWorktreeListText(await getAllWorktreeStatuses(gitRoot)), "info");
+		return;
+	}
+	await browseWorktrees(ctx, () => getAllWorktreeStatuses(gitRoot), async ({ command, worktree }) => {
+		const branch = worktree?.branch ?? "";
+		switch (command) {
+			case "create": {
+				const name = await ctx.ui.input("Enter new branch name for worktree:");
+				if (name?.trim()) await handleCreateCommand(name.trim(), ctx, gitRoot);
+				return;
+			}
+			case "sessions": await handleSessionsCommand(ctx, gitRoot); return;
+			case "switch": await handleSwitchCommand(branch, ctx, gitRoot); return;
+			case "rebase": await handleRebaseCommand(branch, ctx, gitRoot, pi); return;
+			case "tip": await handleRebaseCommand(branch, ctx, gitRoot, pi, "tip"); return;
+			case "pr": await handlePrCommand(branch, ctx, gitRoot); return;
+			case "rename": await handleRenameCommand(branch, ctx, gitRoot); return;
+			case "remove": await handleRemoveCommand(branch, ctx, gitRoot); return;
+			case "clean": await handleCleanCommand(ctx, gitRoot); return;
+			case "help": showHelp(ctx); return;
+			case "list": return;
+		}
+	});
 }
 
 async function handleCleanCommand(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
@@ -1601,7 +1631,7 @@ export default function (pi: ExtensionAPI) {
 					await showInteractiveWorktreeMenu(ctx, route.gitRoot, pi, handlePrCommand);
 					return;
 				case "list":
-					await handleListCommand(ctx, route.gitRoot);
+					await handleListCommand(ctx, route.gitRoot, pi, handlePrCommand);
 					return;
 				case "sessions":
 					await handleSessionsCommand(ctx, route.gitRoot);
