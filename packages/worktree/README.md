@@ -10,7 +10,7 @@ Spin out new features, bugfixes, and experiments into isolated git worktrees run
 - **Tmux native**: inside tmux, opens a new window in the active session; otherwise creates a detached session.
 - **Tracking & registry**: tracks worktrees created by the extension in the main checkout's `.pi/worktrees.json` (shared by every linked worktree). Each created worktree is also kept in `known`, which is not removed when the checkout is deleted.
 - **Sessions across worktrees**: `/worktree sessions` opens a picker like `/resume`, starting with every recorded worktree, including checkouts that no longer exist. Tab switches to the current folder. Search matches the session text, branch, and worktree name (`branch:` and `worktree:` limit a token; Ctrl+Shift+B cycles the field). Sort and the named-session filter use the same keys as `/resume`. Choosing a session forks it into the current folder or another living directory when that folder is not already the session's directory. `git worktree list` is used only when nothing has been written down yet. Outside a git repository, the same command opens the usual session list.
-- **Easy cleanup**: safely kills tmux windows, removes git worktrees, and deletes topic branches with `/worktree clean`. Cleanup drops the active record and leaves the `known` path so its sessions stay reachable.
+- **Easy cleanup**: `/worktree remove` and `/worktree clean` close the worktree’s tmux windows by ID, including renamed windows and windows discovered by checkout path outside tmux. Shared parent sessions and unrelated windows are preserved; dedicated worktree sessions disappear when their last window closes. Cleanup drops the active record and leaves the `known` path so its sessions stay reachable.
 - **Flexible management**: list, switch, rename, or remove individual worktrees.
 - **Two local rebase directions with Pi conflict resolution**: `/worktree rebase [branch]` replays local `main`/`master` onto the current/selected topic's committed tip; `/worktree tip [branch]` replays the topic onto local `main`/`master`. Pi resolves conflicts in the checkout of the branch actually being rewritten.
 - **PR delivery with verified CI**: `/worktree pr [branch]` selects a clean topic worktree, asks Pi to rebase onto remote `main`/`master`, resolve conflicts, write the body using `/skill:pr`, push the topic branch, create/reuse its PR, and repair CI failures. An independent extension gate verifies the open PR's latest pushed SHA and GitHub checks before marking the workflow green.
@@ -81,6 +81,8 @@ The extension prepares the selection and performs read-only Git/GitHub probes; P
 
 ```bash
 node --experimental-strip-types packages/worktree/test.ts
+# Requires tmux and the package’s Pi peer dependencies; uses an isolated tmux server:
+node --experimental-strip-types packages/worktree/remove.test.ts
 node --experimental-strip-types packages/worktree/rebase.test.ts
 node --experimental-strip-types packages/worktree/pr.test.ts
 # Requires the package's Pi peer dependencies to be installed:

@@ -454,7 +454,8 @@ async function getCurrentTmuxSession(): Promise<string | null> {
 
 async function checkTmuxWindowExists(target: string): Promise<boolean> {
 	const res = await exec("tmux", ["display-message", "-p", "-t", target, "#{window_id}"]);
-	return res.exitCode === 0;
+	// display-message can succeed with empty output for a missing target.
+	return res.exitCode === 0 && /^@\d+$/.test(res.stdout);
 }
 
 async function checkTmuxSessionExists(sessionName: string): Promise<boolean> {
@@ -462,12 +463,42 @@ async function checkTmuxSessionExists(sessionName: string): Promise<boolean> {
 	return res.exitCode === 0;
 }
 
-async function killTmuxTarget(target: string): Promise<void> {
-	// Try killing window first, then session
-	if (target.startsWith("@") || target.includes(":")) {
-		await exec("tmux", ["kill-window", "-t", target]);
-	} else {
-		await exec("tmux", ["kill-session", "-t", target]);
+/** Close worktree windows by ID; never kill the shared session that hosts them. */
+async function closeWorktreeTmuxWindows(worktreePath: string, record?: ManagedRecord): Promise<void> {
+	const panes = await exec("tmux", [
+		"list-panes", "-a", "-F", "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+	]);
+	if (panes.exitCode !== 0) {
+		// No tmux installation/server means there are no windows to close.
+		if (!(await isTmuxAvailable()) || /no server running|No such file or directory/i.test(panes.stderr)) return;
+		throw new Error(`Cannot list tmux windows: ${panes.stderr || panes.stdout}`);
+	}
+
+	const root = canonicalPath(worktreePath);
+	const windows = new Set<string>();
+	for (const line of panes.stdout.split("\n")) {
+		const [windowId, sessionName, windowName, panePath] = line.split("\t");
+		if (!/^@\d+$/.test(windowId)) continue;
+		const relative = panePath ? path.relative(root, canonicalPath(panePath)) : undefined;
+		const inWorktree = relative !== undefined &&
+			(relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`)));
+		// Old creation fallbacks recorded the window name instead of its ID.
+		// Compare literal names here: `wt:topic` is not a valid tmux target expression.
+		const recordedWindow = record?.tmuxWindowId &&
+			((record.tmuxWindowId === windowId && (!record.tmuxSession || record.tmuxSession === sessionName)) ||
+				(record.tmuxWindowId === windowName && record.tmuxSession === sessionName));
+		const dedicatedSession = record && !record.tmuxWindowId &&
+			record.tmuxSession === `pi-wt-${sanitizeBranchForPath(record.branch)}` &&
+			record.tmuxSession === sessionName;
+		if (inWorktree || recordedWindow || dedicatedSession) windows.add(windowId);
+	}
+
+	for (const windowId of windows) {
+		const result = await exec("tmux", ["kill-window", "-t", windowId]);
+		// A window may have exited between discovery and cleanup.
+		if (result.exitCode !== 0 && await checkTmuxWindowExists(windowId)) {
+			throw new Error(`Cannot close tmux window ${windowId}: ${result.stderr || result.stdout}`);
+		}
 	}
 }
 
@@ -739,16 +770,8 @@ async function cleanManagedWorktrees(gitRoot: string): Promise<CleanWorktreesRes
 
 	for (const rec of entries) {
 		try {
-			// 1. Kill tmux window / session
-			if (rec.tmuxWindowId) {
-				await killTmuxTarget(rec.tmuxWindowId);
-			}
-			if (rec.tmuxSession) {
-				await killTmuxTarget(rec.tmuxSession);
-			}
-			// Also kill by name convention
-			await killTmuxTarget(`wt:${sanitizeBranchForPath(rec.branch)}`);
-			await killTmuxTarget(`pi-wt-${sanitizeBranchForPath(rec.branch)}`);
+			// 1. Close only this worktree's tmux windows.
+			await closeWorktreeTmuxWindows(rec.path, rec);
 
 			// 2. Remove git worktree
 			const rmRes = await exec("git", ["worktree", "remove", "--force", rec.path], gitRoot);
@@ -794,12 +817,12 @@ async function removeSingleWorktree(
 		return { success: false, error: "Cannot remove the main repository worktree" };
 	}
 
-	// 1. Kill tmux window/session if active
-	if (target.tmuxTarget) {
-		await killTmuxTarget(target.tmuxTarget);
+	// 1. Close its windows even when metadata is missing or the command runs outside tmux.
+	try {
+		await closeWorktreeTmuxWindows(target.path, target.managedRecord);
+	} catch (error) {
+		return { success: false, error: error instanceof Error ? error.message : String(error) };
 	}
-	await killTmuxTarget(`wt:${sanitizeBranchForPath(branch)}`);
-	await killTmuxTarget(`pi-wt-${sanitizeBranchForPath(branch)}`);
 
 	// 2. Remove git worktree
 	const rmRes = await exec("git", ["worktree", "remove", "--force", target.path], gitRoot);
