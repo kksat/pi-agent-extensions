@@ -2,6 +2,8 @@
 SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
 */
 
+import { DEFAULT_WORKTREE_ALIASES, resolveWorktreeSubcommand, type SubcommandAliases } from "./aliases.ts";
+
 /**
  * Decides what `/worktree` does before any git or session work.
  * Commands that must work outside a repository are listed here, not as
@@ -24,18 +26,20 @@ export type WorktreeRoute =
 	| { type: "help" }
 	| { type: "create"; gitRoot: string; args: string };
 
-const SESSION_SUBCOMMANDS = new Set(["sessions", "session"]);
-
-export function routeWorktreeCommand(args: string, gitRoot: string | null): WorktreeRoute {
+export function routeWorktreeCommand(
+	args: string,
+	gitRoot: string | null,
+	aliases: SubcommandAliases = DEFAULT_WORKTREE_ALIASES.subcommandAliases,
+): WorktreeRoute {
 	const trimmed = args.trim();
 	const parts = trimmed.length > 0 ? trimmed.split(/\s+/) : [];
-	const sub = (parts[0] ?? "").toLowerCase();
+	const sub = resolveWorktreeSubcommand(parts[0] ?? "", aliases);
 	const rest = parts.slice(1).join(" ");
 
 	if (!gitRoot) {
 		if (trimmed.length === 0) return { type: "menu", gitRoot: null };
-		if (SESSION_SUBCOMMANDS.has(sub)) return { type: "folder-sessions" };
-		if (sub === "help" || sub === "--help" || sub === "-h") return { type: "help" };
+		if (sub === "sessions") return { type: "folder-sessions" };
+		if (sub === "help") return { type: "help" };
 		return { type: "need-git" };
 	}
 
@@ -43,30 +47,18 @@ export function routeWorktreeCommand(args: string, gitRoot: string | null): Work
 
 	switch (sub) {
 		case "create":
-		case "add":
-		case "new":
 			return { type: "create", gitRoot, args: rest };
 		case "list":
-		case "ls":
 			return { type: "list", gitRoot };
 		case "sessions":
-		case "session":
 			return { type: "sessions", gitRoot };
 		case "clean":
-		case "cleanup":
-		case "prune":
 			return { type: "clean", gitRoot };
 		case "remove":
-		case "rm":
-		case "del":
-		case "delete":
 			return { type: "remove", gitRoot, args: rest };
 		case "rename":
-		case "mv":
 			return { type: "rename", gitRoot, args: rest };
 		case "switch":
-		case "attach":
-		case "go":
 			return { type: "switch", gitRoot, args: rest };
 		case "rebase":
 			return { type: "rebase", gitRoot, args: rest };
@@ -75,8 +67,6 @@ export function routeWorktreeCommand(args: string, gitRoot: string | null): Work
 		case "pr":
 			return { type: "pr", gitRoot, args: rest };
 		case "help":
-		case "--help":
-		case "-h":
 			return { type: "help" };
 		default:
 			return { type: "create", gitRoot, args: trimmed };

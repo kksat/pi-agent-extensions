@@ -26,7 +26,8 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
  *   /worktree pr [branch]             - Select a worktree, rebase onto remote main/master, create PR, and ensure green CI
  *   /worktree help                    - Show worktree command help
  *
- * Also provides alias shortcuts:
+ * Also provides configurable alias shortcuts (agent directory's worktree.json):
+ *   /wt [args]                        - Alias for /worktree (including /wt l for /worktree list)
  *   /worktrees                        - Quick alias for /worktree list
  *   /worktree-clean                   - Quick alias for /worktree clean
  *   /worktree-remove [branch]         - Quick alias for /worktree remove
@@ -38,6 +39,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	getAgentDir,
 	SessionManager,
 	SessionSelectorComponent,
 	type ExtensionAPI,
@@ -48,6 +50,7 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { routeWorktreeCommand } from "./route.ts";
+import { loadWorktreeAliases, registerWorktreeCommands, resolveWorktreeSubcommand, type SubcommandAliases } from "./aliases.ts";
 import { selectWorktreeCommand } from "./command-menu.ts";
 import { selectSearchableItem, selectWorktree } from "./worktree-picker.ts";
 import { handleWorktreeRebase, handleWorktreeTip, isRebaseTarget } from "./rebase.ts";
@@ -1276,7 +1279,9 @@ function showHelp(ctx: ExtensionContext): void {
 		"  /worktree help                   Show this help message",
 		"",
 		"💡 Worktree pickers: type to fuzzy-search branches or paths; ↑/↓ select, Enter confirms, Escape cancels",
-		"💡 Shorthand aliases: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
+		"💡 Default aliases: /wt = /worktree; /wt l = /worktree list",
+		"💡 Also: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
+		"💡 Configure commandAliases and subcommandAliases in your agent directory's worktree.json; /reload applies changes",
 	].join("\n");
 
 	ctx.ui.notify(helpText, "info");
@@ -1486,6 +1491,7 @@ async function handleSwitchCommand(args: string, ctx: ExtensionCommandContext, g
 async function getWorktreeArgumentCompletions(
 	prefix: string,
 	gitRoot: string | null,
+	aliases: SubcommandAliases,
 ): Promise<AutocompleteItem[] | null> {
 	const subcommands = [
 		{ value: "create", label: "create <branch>", description: "Create worktree & run pi" },
@@ -1500,6 +1506,15 @@ async function getWorktreeArgumentCompletions(
 		{ value: "pr", label: "pr [branch]", description: "Remote-base rebase, create PR with /skill:pr, and verify green CI" },
 		{ value: "help", label: "help", description: "Show help" },
 	];
+
+	for (const [alias, target] of Object.entries(aliases)) {
+		const canonical = subcommands.find((command) => command.value === target);
+		if (canonical) subcommands.push({
+			value: alias,
+			label: alias + canonical.label.slice(target.length),
+			description: `Alias for ${target}: ${canonical.description}`,
+		});
+	}
 
 	const trimmed = prefix.trimStart();
 	const parts = trimmed.split(/\s+/);
@@ -1525,15 +1540,15 @@ async function getWorktreeArgumentCompletions(
 	}
 
 	// Subcommand argument completion (e.g. /worktree remove <tab>, /worktree switch <tab>)
-	const sub = parts[0].toLowerCase();
+	const sub = resolveWorktreeSubcommand(parts[0], aliases);
 	const subArg = parts[1] || "";
 
-	if (["remove", "rm", "delete", "switch", "attach", "rename", "rebase", "tip", "pr"].includes(sub) && gitRoot) {
+	if (["remove", "switch", "rename", "rebase", "tip", "pr"].includes(sub) && gitRoot) {
 		const statuses = await getAllWorktreeStatuses(gitRoot);
 		const branchMatches = statuses
 			.filter((s) => (["rebase", "tip", "pr"].includes(sub) ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
 			.map((s) => ({
-				value: `${sub} ${s.branch!}`,
+				value: `${parts[0]} ${s.branch!}`,
 				label: s.branch!,
 				description: s.path,
 			}));
@@ -1548,6 +1563,7 @@ async function getWorktreeArgumentCompletions(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	const aliases = loadWorktreeAliases(getAgentDir());
 	const prWorkflow = new WorktreePrWorkflow({
 		run: (command, args, cwd) => exec(command, args, cwd),
 		getWorktrees: getGitWorktrees,
@@ -1564,16 +1580,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_before_settle", (event) => prWorkflow.beforeSettle(event.outcome, event.continue));
 
 	// Primary command: /worktree
-	pi.registerCommand("worktree", {
+	registerWorktreeCommands(pi, {
 		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase, tip, pr)",
 		getArgumentCompletions: async (prefix) => {
 			const gitRoot = await getGitRoot(process.cwd());
-			return getWorktreeArgumentCompletions(prefix, gitRoot);
+			return getWorktreeArgumentCompletions(prefix, gitRoot, aliases.subcommandAliases);
 		},
 		handler: async (args, ctx) => {
 			const gitRoot = await getGitRoot(ctx.cwd);
 			// Non-git behavior is decided in routeWorktreeCommand. Do not return early here.
-			const route = routeWorktreeCommand(args, gitRoot);
+			const route = routeWorktreeCommand(args, gitRoot, aliases.subcommandAliases);
 			switch (route.type) {
 				case "folder-sessions":
 					await handleFolderSessionsCommand(ctx);
@@ -1619,56 +1635,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 			}
 		},
-	});
-
-	// Dedicated Aliases
-	pi.registerCommand("worktrees", {
-		description: "List all git worktrees (alias for /worktree list)",
-		handler: async (_args, ctx) => {
-			const gitRoot = await getGitRoot(ctx.cwd);
-			if (!gitRoot) {
-				ctx.ui.notify("Error: Not inside a git repository.", "error");
-				return;
-			}
-			await handleListCommand(ctx, gitRoot);
-		},
-	});
-
-	pi.registerCommand("worktree-clean", {
-		description: "Clean up managed worktrees and branches (alias for /worktree clean)",
-		handler: async (_args, ctx) => {
-			const gitRoot = await getGitRoot(ctx.cwd);
-			if (!gitRoot) {
-				ctx.ui.notify("Error: Not inside a git repository.", "error");
-				return;
-			}
-			await handleCleanCommand(ctx, gitRoot);
-		},
-	});
-
-	pi.registerCommand("worktree-remove", {
-		description: "Remove a worktree and its branch (alias for /worktree remove)",
-		handler: async (args, ctx) => {
-			const gitRoot = await getGitRoot(ctx.cwd);
-			if (!gitRoot) {
-				ctx.ui.notify("Error: Not inside a git repository.", "error");
-				return;
-			}
-			await handleRemoveCommand(args, ctx, gitRoot);
-		},
-	});
-
-	pi.registerCommand("worktree-rename", {
-		description: "Rename a worktree's branch (alias for /worktree rename)",
-		handler: async (args, ctx) => {
-			const gitRoot = await getGitRoot(ctx.cwd);
-			if (!gitRoot) {
-				ctx.ui.notify("Error: Not inside a git repository.", "error");
-				return;
-			}
-			await handleRenameCommand(args, ctx, gitRoot);
-		},
-	});
+	}, aliases.commandAliases);
 
 	pi.registerTool({
 		name: "worktree_pr_pause",

@@ -15,6 +15,7 @@ Spin out new features, bugfixes, and experiments into isolated git worktrees run
 - **Searchable worktree pickers**: every terminal worktree-selection dialog supports typing to fuzzy-search branch names and checkout paths, including switch, rename, remove, rebase, tip, PR, their menu/alias entry points, and the session-resume destination. The blank search still allows direct ↑/↓ selection; Enter selects the highlighted worktree, Escape cancels, and clearing the search restores the full list. RPC clients retain standard selection dialogs.
 - **Two local rebase directions with Pi conflict resolution**: `/worktree rebase [branch]` replays local `main`/`master` onto the current/selected topic's committed tip; `/worktree tip [branch]` replays the topic onto local `main`/`master`. Pi resolves conflicts in the checkout of the branch actually being rewritten.
 - **PR delivery with verified CI**: `/worktree pr [branch]` selects a clean topic worktree, asks Pi to rebase onto remote `main`/`master`, resolve conflicts, write the body using `/skill:pr`, push the topic branch, create/reuse its PR, and repair CI failures. An independent extension gate verifies the open PR's latest pushed SHA and GitHub checks before marking the workflow green.
+- **Configurable command aliases**: `/wt` behaves exactly like `/worktree`, and `/wt l` runs `/worktree list`. Command aliases (including the existing `/worktrees` and `/worktree-*` shortcuts) and subcommand shorthands can be added, remapped, or disabled in the agent directory's `worktree.json`.
 - **Searchable command menu**: `/worktree` with no arguments opens a focused search field above all worktree actions. Type a command name or description to fuzzy-filter and rank matches (for example, `rbs` finds rebase); use ↑/↓ to navigate, Enter to choose, and Escape to cancel. Clearing the search restores the full list. Sessions remains available inside and outside repositories. RPC clients retain the standard selection dialog.
 - **LLM tools**: exposes `worktree_create`, `worktree_list`, `worktree_clean`, `worktree_remove`, and `worktree_rename` to the agent.
 
@@ -47,6 +48,38 @@ pi install npm:pi-extension-worktree
 | `/worktree tip [branch]` | Rebase the current/selected topic worktree onto local `main`/`master`; Pi resolves conflicts in the topic checkout |
 | `/worktree pr [branch]` | Select a topic worktree (or name one), rebase onto remote `main`/`master`, create/reuse its PR with `/skill:pr`, and verify green CI |
 | `/worktree help` | Show help |
+
+## Command aliases
+
+By default, **every** `/worktree` invocation also works with `/wt`, including `/wt` (menu), `/wt <branch> [base]`, `/wt rebase [branch]`, `/wt tip [branch]`, `/wt pr [branch]`, and `/wt sessions`. The shorthand `l` means `list` under either command: `/wt l` and `/worktree l` run the same command as `/worktree list`. Completion and confirmation/safety behavior are shared with the canonical command.
+
+Configure aliases in `~/.pi/agent/worktree.json` (or `worktree.json` under `PI_CODING_AGENT_DIR`):
+
+```json
+{
+  "commandAliases": {
+    "wt": "worktree",
+    "w": "worktree",
+    "topics": "list",
+    "worktree-clean": null
+  },
+  "subcommandAliases": {
+    "l": "list",
+    "ll": "list",
+    "r": "rebase",
+    "t": "tip"
+  }
+}
+```
+
+- **`commandAliases`** maps a slash-command name **without `/`** to `worktree` (forward all arguments) or a canonical subcommand (prepend that subcommand). For example, `/w r topic` means `/worktree rebase topic`, and `/topics` means `/worktree list`.
+- **`subcommandAliases`** maps a first-argument shorthand to a canonical subcommand. The mapping applies to `/worktree` and all its full-command aliases. Arguments after the shorthand are preserved.
+- Omitted entries keep their defaults. A string adds/remaps an alias; `null` disables it. For example, `"wt": null` disables `/wt`, and `"l": null` removes the list shorthand. The canonical `/worktree` command and canonical subcommands cannot be disabled or overridden.
+- Targets are `create`, `list`, `sessions`, `clean`, `remove`, `rename`, `switch`, `rebase`, `tip`, `pr`, and `help`, plus `worktree` for slash-command aliases. Alias chains and targets containing arguments are rejected.
+- Use lowercase alias names without spaces. Existing slash aliases default to `worktrees → list`, `worktree-clean → clean`, `worktree-remove → remove`, and `worktree-rename → rename`. Existing subcommand synonyms (`ls`, `add`, `new`, `session`, `cleanup`, `prune`, `rm`, `del`, `delete`, `mv`, `attach`, `go`, `--help`, `-h`) remain enabled and are configurable in the same way.
+- Unknown first arguments still name branches for creation. To create a branch whose name is an enabled shorthand, use explicit creation, e.g. `/wt create l main`. Disabling a subcommand shorthand makes that name available for branch creation again.
+
+Run `/reload` after editing the file. Enabled aliases appear in command/argument completion. A missing file uses defaults; an invalid file reports its path and prevents the extension from registering commands, rather than silently applying different aliases. Command aliases and terminal keybindings are configured separately.
 
 ## Rebasing
 
@@ -87,6 +120,7 @@ node --experimental-strip-types packages/worktree/remove.test.ts
 node --experimental-strip-types packages/worktree/rebase.test.ts
 node --experimental-strip-types packages/worktree/pr.test.ts
 # Requires the package's Pi peer dependencies to be installed:
+node --experimental-strip-types packages/worktree/aliases.test.ts
 node --experimental-strip-types packages/worktree/command-menu.test.ts
 node --experimental-strip-types packages/worktree/worktree-picker.test.ts
 ```
