@@ -2,28 +2,24 @@
 // 2bcb88c38921030033a37d67ae4f5d82cea90eb4, .pi/extensions/fm-calm.ts.
 // Local changes: the Calm preference is fixed at ~/.pi/agent/calm, the operational-input
 // helper is fixed at the bundled ./bin script, the working presentation uses a curated
-// animation rotation, and codemode rows are hidden by a presentation-only adapter.
+// animation rotation, and all tool/subagent rows and routine transcript noise are
+// hidden by presentation-only adapters.
 //
 // Firstmate's home-persistent Pi transcript presentation toggle.
 //
-// Verified against Pi 0.81.1, 0.82.0, and 0.84.4, which expose built-in ToolDefinitions, per-slot
-// renderers, renderShell: "self", session_start replacement reasons, agent_start and
-// agent_settled, ExtensionUIContext.setToolsExpanded(), setWorkingVisible(), setWidget()
-// with a disposable component factory, and setHiddenThinkingLabel().
+// Working/lifecycle and legacy built-in fallback APIs were verified against Pi
+// 0.81.1, 0.82.0, and 0.84.4. The universal presentation adapters and regression
+// checks use Pi 1.1.0's real tool, assistant, and InteractiveMode components.
 // ./lib/fm-calm-working-ship.ts owns the animated working presentation this file
 // installs. The focused tests pin those assumptions but never reject a
-// newer Pi solely for its version. The collapsed-thinking, operational-user, and codemode
+// newer Pi solely for its version. The assistant, operational-user, tool, and transcript
 // presentation adapters probe the exact API they patch and degrade independently with a
-// diagnostic (see installCalmPresentationAdapter below) if a future Pi removes it; Pi
-// still exposes no global renderer for arbitrary built-in or custom rows.
-// docs/configuration.md owns the home-local Calm preference contract.
+// diagnostic (see installCalmPresentationAdapter below) if a future Pi removes it.
 //
-// Pi has one first-registration-wins ToolDefinition per tool name, with no merge or
-// unregister operation. Keep Calm-off registration empty; keep Calm-on load-time
-// registration synchronous because restored rows capture the registry before
-// session_start; and collision-check only the later first-activation path, when
-// getAllTools() is reliable. docs/calm-mode-feasibility.md owns the Pi-source evidence
-// and docs/calm.md owns the user-facing behavior and non-retroactive first-toggle bound.
+// Normally Calm never claims tool names. If the universal tool-row seam is missing,
+// the legacy built-in renderer fallback still obeys Pi's first-registration-wins
+// registry: keep Calm-off registration empty, register synchronously when Calm is
+// already on, and collision-check only first activation when getAllTools() is reliable.
 import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
@@ -66,6 +62,7 @@ import {
 import { installCalmAssistantLayout } from "./lib/fm-calm-assistant-layout.ts";
 import { installCalmOperationalUserLayout } from "./lib/fm-calm-operational-user-layout.ts";
 import { installCalmToolLayout } from "./lib/fm-calm-tool-layout.ts";
+import { installCalmTranscriptLayout } from "./lib/fm-calm-transcript-layout.ts";
 import {
   CALM_WORKING_SHIP_WIDGET_KEY,
   createCalmWorkingShipAnimation,
@@ -127,19 +124,22 @@ const extensionRealFile = realpathOrSelf(extensionFile);
 
 // Each presentation adapter probes the exact Pi API it patches. If a future Pi removes
 // that API, only the affected adapter degrades; the rest of Calm keeps working.
-function installCalmPresentationAdapter(name: string, install: () => void): void {
+function installCalmPresentationAdapter(name: string, install: () => void): boolean {
   try {
     install();
+    return true;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.error(`Firstmate Calm: ${name} presentation adapter unavailable, skipping. ${reason}`);
+    return false;
   }
 }
 
 export default function (pi: ExtensionAPI) {
   installCalmPresentationAdapter("collapsed-thinking", installCalmAssistantLayout);
   installCalmPresentationAdapter("operational-user-row", installCalmOperationalUserLayout);
-  installCalmPresentationAdapter("codemode-tool-row", installCalmToolLayout);
+  const allToolRowsSupported = installCalmPresentationAdapter("tool-row", installCalmToolLayout);
+  installCalmPresentationAdapter("transcript-noise", installCalmTranscriptLayout);
 
   let exportRendering = false;
   let removeTerminalInputHandler: (() => void) | undefined;
@@ -346,6 +346,9 @@ export default function (pi: ExtensionAPI) {
     wrapBuiltIn(createLsToolDefinition),
   ];
 
+  // Legacy built-in overrides are a fallback only when the all-tool presentation
+  // seam is unavailable. Normally Calm claims no tools, preserving ownership,
+  // executors, and custom renderers from every other extension.
   // True once this extension has handled built-in registration for its lifetime:
   // either all seven synchronously at load, or only the uncontested subset during
   // first activation.
@@ -355,7 +358,7 @@ export default function (pi: ExtensionAPI) {
   // unconditional here (see file header): a foreign-claim check is not reachable at
   // this point, while deferral would make restored rows capture the wrong definition.
   // A Calm-off session or reload registers nothing and creates no collision exposure.
-  if (loadCalmPreference()) {
+  if (!allToolRowsSupported && loadCalmPreference()) {
     for (const tool of wrappedBuiltIns) pi.registerTool(tool);
     builtInsRegistered = true;
   }
@@ -383,7 +386,7 @@ export default function (pi: ExtensionAPI) {
   // untouched. Tell the user which built-in Calm could not take over, since Calm's
   // presentation does not apply to it.
   function activateBuiltInsIfNeeded(ui: ExtensionUIContext): void {
-    if (builtInsRegistered) return;
+    if (allToolRowsSupported || builtInsRegistered) return;
     const contested = contestedBuiltIns();
     const contestedNames = new Set(contested.map((tool) => tool.name));
     for (const tool of wrappedBuiltIns) {
@@ -544,9 +547,9 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setHiddenThinkingLabel(active ? "" : undefined);
       ctx.ui.setStatus("firstmate-calm", undefined);
 
-      const expanded = ctx.ui.getToolsExpanded();
-      ctx.ui.setToolsExpanded(!expanded);
-      ctx.ui.setToolsExpanded(expanded);
+      // Invalidate owned renderer slots without emitting tools-expanded status
+      // lines. The other adapters consult the live policy in render().
+      repaintCalmToolRows();
     },
   });
 }

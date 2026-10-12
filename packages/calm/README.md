@@ -2,14 +2,16 @@
 
 A [pi](https://pi.dev) extension that adds **Calm mode**: a conversation-only transcript presentation, toggled with `/calm`.
 
-While Calm is on, pi's transcript shows only the genuine conversation — your prompts, the agent's real replies, and the working status — and hides the noise in between: collapsed thinking, short mid-turn "working note" narration, and the built-in tool rows (`bash`, `read`, `edit`, `write`, `grep`, `find`, `ls`) plus `codemode` calls and output. While an agent run is under way, the stock `Working...` row is replaced by one of 14 horizontal animations, each only one or two rows tall.
+While Calm is on, pi shows your prompts, the agent's final replies, and the working indicator. All tool calls and output — including subagents, built-ins, `codemode`, MCP, and other extensions — are hidden, along with thinking, intermediate narration, operational messages, summaries, and extension progress widgets/statuses. Required input dialogs, warnings/errors, and command confirmations remain visible. While an agent run is under way, the stock `Working...` row is replaced by one of 14 horizontal animations, each only one or two rows tall.
 
 Nothing is deleted. Hidden content stays in the message, the model context, session storage, and `/export` artifacts — Calm changes presentation only.
 
 ## Behavior
 
-- **Conversation-only transcript.** Collapsed thinking labels, short mid-turn assistant working notes, the built-in tool rows Calm owns, and entire `codemode` rows (calls, output, and images) are hidden from the live view. Toggling `/calm` applies to existing codemode rows too; turning it off restores them. Tool execution, nested calls, and stored results are unchanged.
-- **Substantive text is preserved.** A mid-turn assistant text block is hidden only when it has no newline and its trimmed length is under 240 characters. A newline or ≥240 trimmed characters keeps it visible. Streaming text and the final reply always stay visible.
+- **Every tool row is hidden.** Calls, partial/completed output, images, and tool errors occupy zero rows, regardless of the tool's name or owner. This includes subagent start/check/wait/send calls and unfamiliar tools restored from a session. Toggling `/calm` applies to existing rows; turning it off restores them. Executors, nested calls, arguments, and stored results are unchanged.
+- **Only genuine assistant replies.** Thinking stays hidden even when expanded. All tool-use narration is hidden, including long or multiline text. Genuine replies still stream; text is suppressed once the message contains a tool call or ends with `toolUse`. Abort, provider-error, and truncation notices remain visible even when the associated tool row is hidden.
+- **Operational noise is hidden.** Custom extension messages/entries (including subagent kickoff prompts and status reports), user-bash output, skill bodies, compaction/branch summaries, cache notices, and extension progress widgets/footer statuses are hidden. Skill arguments supplied by you remain visible. Calm's working animation and explicitly requested `/calm-preview` remain visible.
+- **Required interaction stays visible.** Input/confirmation dialogs, selectors, overlays, warnings/errors, and command confirmations such as an export's destination are not suppressed. Use `/calm` to inspect hidden operational details or other extensions' widgets.
 - **Animated working scene.** Each run randomly chooses from the preferred sailboat, fish, duck, ball, spinner, progress bar, wave, butterfly, and cat, plus five new progress-style bars. Motion travels along the terminal's full width or forms a full-width texture; every working scene uses at most two rows. Scenes reflow on resize and disappear when the run settles, aborts, or fails. The next run starts a freshly chosen scene.
 - **Operational input rows.** User rows recognized by the bundled Firstmate operational-input parser (session-start, watcher, turn-end guard, away-supervisor, launch-brief, branch-outcome, from-firstmate) render at zero height. Every other user row stays visible.
 - **Export stays complete.** `/export` and `/share` temporarily render stock rows so exported artifacts contain everything.
@@ -97,9 +99,9 @@ pi install npm:pi-extension-calm
 
 ## Compatibility
 
-Calm probes the exact pi API seams it patches (collapsed-thinking layout, operational-user rows, codemode tool-row rendering) and degrades one adapter at a time with a console diagnostic if a future pi removes a seam — `/calm` and the rest of the extension keep working.
+Calm probes the exact pi API seams it patches (assistant layout, operational-user rows, all-tool row rendering, and transcript/widget/status presentation) and degrades one adapter at a time with a console diagnostic if a future pi removes a seam — `/calm` and the rest of the extension keep working. The focused checks exercise Pi 1.1.0's real UI components.
 
-Calm's built-in tool presentation shares pi's single, unmerged override slot per tool name with any other extension that overrides the same tool. While Calm is off it registers none of them. The first time Calm turns on in a session that started off, it claims every built-in name no other extension already owns and warns about the ones it skipped.
+Normally Calm does not register or claim any tool names: other extensions keep their executors, ownership, and custom renderers. If the all-tool render seam is unavailable, legacy built-in overrides provide a limited fallback, skipping names already owned by other extensions. Non-interactive execution and transcript storage are unchanged.
 
 ## Tests
 
@@ -109,12 +111,16 @@ The animation catalogue has a self-running check:
 node --experimental-strip-types packages/calm/test.ts
 ```
 
-With the host peer dependencies available, the codemode presentation regression checks
-exercise Pi’s real `ToolExecutionComponent`, including toggles, streaming/completed
-output, export rendering, and reload-safe installation:
+With the host peer dependencies available, the presentation regression checks
+exercise Pi's real tool, assistant, and transcript components, including toggles,
+streaming/completed output, preserved prompts/failures, export rendering, widgets,
+footer statuses, and reload-safe installation:
 
 ```bash
 node --experimental-strip-types packages/calm/test-tool-layout.ts
+node --experimental-strip-types packages/calm/test-assistant-layout.ts
+node --experimental-strip-types packages/calm/test-transcript-layout.ts
+node --experimental-strip-types packages/calm/test-extension.ts
 ```
 
 ## Provenance
