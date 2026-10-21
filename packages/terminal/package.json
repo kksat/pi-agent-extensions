@@ -3,6 +3,9 @@
 	"version": "0.1.0",
 	"description": "pi extension: embedded PTY-backed terminal pane toggled with Ctrl+/ — state persists while hidden, dies on quit",
 	"type": "module",
+	"scripts": {
+		"test": "jiti test-screen.ts && jiti test.ts"
+	},
 	"keywords": [
 		"pi-package",
 		"pi-extension",
@@ -15,16 +18,21 @@
 		"directory": "packages/terminal"
 	},
 	"dependencies": {
+		"@xterm/addon-serialize": "^0.13.0",
 		"@xterm/headless": "^5.5.0",
 		"node-pty": "^1.1.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*"
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
 	},
 	"pi": {
 		"extensions": [
 			"./index.ts"
 		]
 	},
-	"license": "GPL-3.0-only"
+	"license": "GPL-3.0-only",
+	"devDependencies": {
+		"jiti": "^2.7.0"
+	}
 }

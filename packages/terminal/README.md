@@ -24,7 +24,7 @@ pi install npm:pi-extension-terminal
 ## Features
 
 - **Zero-Lag Native Passthrough Mode:** Run editors like Neovim directly on the host terminal with raw I/O. Completely eliminates chat transcript re-rendering lag in long conversations.
-- **Universal Hotkey Detach/Resume:** Press `alt+e` inside Neovim to suspend it and return to Pi; press `alt+e` in Pi to resume Neovim right where you left off.
+- **Universal Hotkey Detach/Resume:** Press `alt+e` inside Neovim to return to Pi; press `alt+e` in Pi to resume Neovim right where you left off, with screen styling, cursor state, and terminal input modes restored. Output produced while hidden stays in the saved screen, not Pi's transcript.
 - **Pristine Scroll Recovery:** Terminal mouse tracking, alternate screens, and bracketed paste are cleanly restored on detach so Pi's native trackpad/mouse scrolling works without interference.
 - **Decoupled Cross-Session Persistence:** Terminals and editors survive `/new`, `/resume`, `/fork`, and `/reload`.
 - **Throttled Background Rendering:** Hidden overlay terminals update their VT buffers in memory without triggering Pi transcript re-renders.
@@ -94,6 +94,13 @@ Both commands provide an interactive manager with single-key controls:
 - `/terminal kill <name|all>` / `/terminals kill <name|all>`: Gracefully terminate sessions and child process trees.
 - `/terminal restart <name>`: Kill and restart a session.
 - `/terminal focus <name>`: Focus or resume a terminal.
+
+## Development checks
+
+From `packages/terminal`, run `npm install` and `npm test`. The tests cover screen
+serialization and drive a real Neovim PTY through repeated hide/reopen cycles,
+background output, and resizing. They require `nvim` on `PATH` and use an isolated
+configuration and temporary buffers, never your Neovim configuration or files.
 
 ## License
 

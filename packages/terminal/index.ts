@@ -39,6 +39,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CURSOR_MARKER, isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { KeyId, TUI } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
+import { PassthroughScreen } from "./passthrough-screen.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration & Types
@@ -107,6 +108,9 @@ export interface PassthroughSession {
 	sessionId: string;
 	sessionName: string;
 	detachResolver: (() => void) | null;
+	/** Session-owned: keep parsing output even while no UI is attached. */
+	ptyDataDisposable?: { dispose(): void };
+	screen?: PassthroughScreen;
 }
 
 interface GlobalTerminalState {
@@ -239,6 +243,7 @@ async function killAllSessionsGraceful(): Promise<void> {
 
 	for (const ps of globalState.passthroughSessions.values()) {
 		ps.detachResolver = null;
+		ps.ptyDataDisposable?.dispose();
 		promises.push(
 			(async () => {
 				await killProcessTreeGraceful(ps.pid);
@@ -290,7 +295,7 @@ if (!globalState.exitHookInstalled) {
 function resetHostTerminalAfterPassthrough(): void {
 	// 1. Disable all mouse tracking modes:
 	// 1000: normal, 1002: button-event, 1003: any-event, 1006: SGR extended mode
-	const disableMouse = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+	const disableMouse = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
 	// 2. Disable bracketed paste
 	const disableBracketedPaste = "\x1b[?2004l";
 	// 3. Reset application cursor keys and keypad
@@ -298,7 +303,7 @@ function resetHostTerminalAfterPassthrough(): void {
 	// 4. Exit alternate screen back to normal screen buffer
 	const exitAltScreen = "\x1b[?1049l";
 	// 5. Ensure cursor is visible
-	const showCursor = "\x1b[?25h";
+	const showCursor = "\x1b[0m\x1b[?6l\x1b[r\x1b[4l\x1b[?7h\x1b[0 q\x1b[?25h";
 
 	try {
 		process.stdout.write(disableMouse + disableBracketedPaste + resetCursorKeys + exitAltScreen + showCursor);
@@ -949,6 +954,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 
 		if (isDead) {
 			try {
+				session.ptyDataDisposable?.dispose();
 				session.term?.dispose();
 			} catch {}
 			try {
@@ -959,7 +965,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 		}
 	}
 
-	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+	await ctx.ui.custom<void>(async (tui, _theme, _keybindings, done) => {
 		tui.stop();
 
 		const cols = process.stdout.columns || 120;
@@ -1007,9 +1013,9 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				if (globalState.passthroughSessions.get(entry.id) === session) {
 					globalState.passthroughSessions.delete(entry.id);
 					try {
+						session?.ptyDataDisposable?.dispose();
 						session?.term.dispose();
 					} catch {}
-					resetHostTerminalAfterPassthrough();
 					updateFooterStatus(ctx);
 					ctx.ui.notify(`${entry.name} exited${exitCode !== 0 ? ` (code ${exitCode})` : ""}`, "info");
 					session?.detachResolver?.();
@@ -1017,20 +1023,17 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			});
 		}
 
-		let isAttached = true;
-
-		// Listen to PTY data: always keep virtual terminal buffer updated;
-		// pipe directly to stdout only while attached
-		const dataDisposable = session!.pty.onData((data) => {
-			session!.term.write(data);
-			if (isAttached) {
-				process.stdout.write(data);
-			}
+		// These belong to the persistent session, not this attachment. In
+		// particular, disposing the PTY listener on hide loses background output.
+		const attachedSession = session!;
+		attachedSession.screen ??= new PassthroughScreen(attachedSession.term);
+		attachedSession.ptyDataDisposable ??= attachedSession.pty.onData((data) => {
+			attachedSession.term.write(data);
+			if (!attachedSession.paused) process.stdout.write(data);
 		});
 
-		if (!isNewSession && session!.paused) {
-			session!.paused = false;
-
+		const isResuming = !isNewSession && session!.paused;
+		if (isResuming) {
 			// Resize PTY and buffer to match current terminal window
 			if (session!.term.cols !== cols || session!.term.rows !== rows) {
 				try {
@@ -1038,21 +1041,6 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 					session!.term.resize(cols, rows);
 				} catch {}
 			}
-
-			// Restore entire screen from virtual terminal buffer in one atomic write
-			const buf = session!.term.buffer.active;
-			const lines: string[] = [];
-			const targetRows = Math.min(rows, buf.length);
-			for (let y = 0; y < targetRows; y++) {
-				lines.push(renderRow(session!.term, y, buf.cursorX, buf.cursorY).replaceAll(CURSOR_MARKER, ""));
-			}
-			process.stdout.write(
-				"\x1b[?1049h\x1b[H" +
-					lines.join("\r\n") +
-					`\x1b[${buf.cursorY + 1};${buf.cursorX + 1}H\x1b[?25h`,
-			);
-		} else {
-			process.stdout.write("\x1b[?25h");
 		}
 
 		const resizeHandler = () => {
@@ -1066,10 +1054,10 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 		process.stdout.on("resize", resizeHandler);
 
 		let cleanedUp = false;
-		const cleanup = (shouldPause: boolean) => {
+		const cleanup = () => {
 			if (cleanedUp) return;
 			cleanedUp = true;
-			isAttached = false;
+			session!.paused = true;
 			session!.detachResolver = null;
 
 			try {
@@ -1079,19 +1067,11 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				process.stdin.off("data", stdinHandler);
 			} catch {}
 			try {
-				dataDisposable.dispose();
-			} catch {}
-
-			try {
 				if (process.stdin.isTTY) {
 					process.stdin.setRawMode(false);
 				}
 				process.stdin.pause();
 			} catch {}
-
-			if (shouldPause && globalState.passthroughSessions.get(entry.id) === session) {
-				session!.paused = true;
-			}
 
 			// FULL RESET OF TERMINAL: disable mouse tracking modes, exit alternate screen, restore cursor
 			resetHostTerminalAfterPassthrough();
@@ -1105,7 +1085,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 			done(undefined);
 		};
 
-		session!.detachResolver = () => cleanup(false);
+		session!.detachResolver = cleanup;
 
 		const attachedAt = Date.now();
 		const COOLDOWN_MS = entry.gracePeriodMs;
@@ -1127,9 +1107,9 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 					return;
 				}
 				if (hit.id === entry.id) {
-					cleanup(true);
+					cleanup();
 				} else {
-					cleanup(true);
+					cleanup();
 					setTimeout(() => {
 						void entryHandlers.get(hit.id)?.(ctx);
 					}, 10);
@@ -1142,7 +1122,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 					// Swallowed initial hotkey release / repeat from launching
 					return;
 				}
-				cleanup(true);
+				cleanup();
 				return;
 			}
 
@@ -1167,6 +1147,18 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 		process.stdin.on("data", stdinHandler);
 
 		updateFooterStatus(ctx);
+
+		if (isResuming) {
+			// Install cleanup first: the process can exit while its asynchronous
+			// parser drains. Don't repaint or reattach an already closed session.
+			await attachedSession.screen.flush();
+			if (!cleanedUp) {
+				process.stdout.write(attachedSession.screen.serialize());
+				attachedSession.paused = false;
+			}
+		} else {
+			process.stdout.write("\x1b[?25h");
+		}
 
 		return { render: () => [], invalidate: () => {} };
 	});
@@ -1288,6 +1280,7 @@ async function killSingleSession(id: string): Promise<boolean> {
 	if (ps) {
 		globalState.passthroughSessions.delete(id);
 		ps.detachResolver?.();
+		ps.ptyDataDisposable?.dispose();
 		await killProcessTreeGraceful(ps.pid);
 		try {
 			ps.pty.kill();
