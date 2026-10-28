@@ -9,8 +9,8 @@ Replaces Pi's main input editor with an authentic, prompt-optimized Vim modal ed
 - **Modes**: `NORMAL`, `INSERT`, `VISUAL` (char), `V-LINE` (linewise), `V-BLOCK` (rectangular block), `REPLACE`, `COMMAND` (`:`), `SEARCH` (`/`)
 - **Motions**: `h`, `j`, `k`, `l`, `w`, `W`, `b`, `B`, `e`, `E`, `ge`, `gE`, `0`, `^`, `$`, `gg`, `G`, `f{c}`, `F{c}`, `t{c}`, `T{c}`, `;`, `,`, `%`, `{`, `}`, `H`, `M`, `L`, `Ctrl+D`, `Ctrl+U`, `Ctrl+F`, `Ctrl+B`
 - **Text Objects**: `iw`, `aw`, `iW`, `aW`, `i"`, `a"`, `i'`, `a'`, `i\``, `a\``, `i(`, `a(`, `ib`, `ab`, `i[`, `a[`, `i{`, `a{`, `iB`, `aB`, `i<`, `a<`, `ip`, `ap`
-- **Operators**: `d` (delete), `c` (change), `y` (yank), `>` (indent), `<` (unindent), `g~` (toggle case), `gu` (lowercase), `gU` (uppercase) + line doubling (`dd`, `cc`, `yy`, `>>`, `<<`)
-- **Editing Actions**: `i`, `I`, `a`, `A`, `o`, `O`, `s`, `S`, `C`, `D`, `x`, `X`, `r{c}`, `R`, `~`, `J`, `p`, `P`, `u`, `Ctrl+R`, `.` (dot repeat)
+- **Operators**: `d` (delete; requires a register prefix in fullscreen Normal mode), `c` (change), `y` (yank), `>` (indent), `<` (unindent), `g~` (toggle case), `gu` (lowercase), `gU` (uppercase) + line doubling (`dd`, `cc`, `yy`, `>>`, `<<`)
+- **Editing Actions**: `i`, `I`, `a`, `A`, `o`, `O`, `s`, `S`, `C`, `D`, `x`, `X`, `r{c}`, `R`, `~`, `J`, `p`, `P`, `U` (undo), `Ctrl+R`, `.` (dot repeat)
 - **Prompt-Native Ex Commands**:
   - `:%s/old/new/g` or `:s/old/new/g` — regex & string search and replace
   - `:quote` / `:unquote` — markdown blockquote toggle (`> ...`)
@@ -67,7 +67,8 @@ pi -e ~/dev/pi-agent-extensions/packages/vim
 
 | Motion | Action |
 |---|---|
-| `h` / `j` / `k` / `l` | Left, down, up, right |
+| `h` / `l` | Draft cursor left / right |
+| `j` / `k` | Conversation line down / up in fullscreen Normal mode; otherwise draft cursor down / up |
 | `w` / `W` | Next word / WORD start |
 | `b` / `B` | Previous word / WORD start |
 | `e` / `E` | Next word / WORD end |
@@ -90,6 +91,8 @@ In Pi's fullscreen view, press these key sequences in **Normal mode** to scroll 
 
 | Keys | Action |
 |---|---|
+| `j` / `k` | Scroll down / up by one line |
+| `d` / `u` | Scroll down / up by half the transcript viewport height |
 | `gg` | Jump to the start of the conversation |
 | `G` | Jump to the end and follow new output |
 | `[q` | Jump to the previous user question |
@@ -100,11 +103,20 @@ In Pi's fullscreen view, press these key sequences in **Normal mode** to scroll 
 Question and answer jumps start from the top of the transcript viewport and skip
 tool calls and results. A count repeats the jump: `2[q` moves back two questions.
 These jumps stop at the first or last matching message without wrapping.
-All conversation jumps leave your draft and editor cursor unchanged.
+All conversation navigation leaves your draft and editor cursor unchanged.
+Counts also apply to scrolling: `3j` scrolls three lines and `2d` scrolls two
+half-pages. Half-page steps adapt to the transcript viewport height. Scrolling
+down to the end resumes following new output; scrolling up pauses following.
+
+Fullscreen Normal mode reserves bare `d` and `u` for scrolling. Use `U` to undo.
+For deletion, select an explicit register: `""dw` deletes a word, `""dd` deletes a
+line, and `"adw` deletes a word into register `a`. You can also use `:d` to delete
+a line. Operator-pending `j` and `k` still address draft lines, so `""dj` deletes
+two lines and `yj` yanks two lines. Visual-mode editing stays unchanged.
 
 Bare `gg` and `G` navigate the conversation. Counted forms such as `2gg` and `2G`
-still move to a draft line, and operator motions such as `dgg` and `dG` still edit
-the draft. `Esc` cancels a pending `g`, `[`, or `]` prefix.
+still move to a draft line, and operator motions such as `""dgg` and `""dG` still
+edit the draft. `Esc` cancels a pending `g`, `[`, or `]` prefix.
 
 In Insert mode, these sequences are ordinary text. They don't navigate in Replace,
 Visual, Search, or Command modes, or while autocomplete or an overlay owns input.

@@ -120,6 +120,144 @@ function fixture(t: { after(fn: () => void): void }, spacing = 12, tail = 30) {
 	return { terminal, tui, editor, chat, questions, answers, scrollView, jumpedRows, rowOf, send, at };
 }
 
+test("j/k scroll by lines and u/d by half-pages without editing the draft", (t) => {
+	const f = fixture(t);
+	f.editor.setText("one\ntwo\nthree");
+	f.editor.setCursorPosition({ line: 1, col: 1 });
+	f.tui.renderNow();
+	const start = f.rowOf(f.answers[1]!);
+	f.at(start);
+	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
+	f.send("j");
+	assert.equal(f.scrollView.scrollTop, start + 1);
+	f.send("k");
+	assert.equal(f.scrollView.scrollTop, start);
+	f.send("d");
+	assert.equal(f.scrollView.scrollTop, start + halfPage);
+	f.send("d");
+	assert.equal(f.scrollView.scrollTop, start + 2 * halfPage);
+	f.send("u", "u");
+	assert.equal(f.scrollView.scrollTop, start);
+	assert.equal(f.editor.getText(), "one\ntwo\nthree");
+	assert.deepEqual(f.editor.getCursorPosition(), { line: 1, col: 1 });
+	assert.equal(f.editor.operator, null);
+	assert.equal(f.editor.pendingKeys, "");
+	assert.equal(f.editor.mode, "normal");
+});
+
+test("scroll counts reset and half-pages track resized transcript height", (t) => {
+	const f = fixture(t);
+	const start = f.rowOf(f.answers[1]!);
+	f.at(start);
+	f.send("3", "j");
+	assert.equal(f.scrollView.scrollTop, start + 3);
+	f.send("2", "k");
+	assert.equal(f.scrollView.scrollTop, start + 1);
+	assert.equal(f.editor.countStr, "");
+	f.terminal.rows = 14;
+	f.tui.renderNow();
+	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
+	f.send("2", "d");
+	assert.equal(f.scrollView.scrollTop, start + 1 + 2 * halfPage);
+	f.send("u");
+	assert.equal(f.scrollView.scrollTop, start + 1 + halfPage);
+	assert.equal(f.editor.countStr, "");
+});
+
+test("scrolling clamps to boundaries and resumes following output at the end", (t) => {
+	const f = fixture(t);
+	const bottom = f.scrollView.scrollTop;
+	f.at(0);
+	f.send("k", "u");
+	assert.equal(f.scrollView.scrollTop, 0);
+	f.send("9", "9", "9", "d");
+	assert.equal(f.scrollView.scrollTop, bottom);
+	assert.equal(f.scrollView.isFollowingEnd, true);
+	f.send("u");
+	assert(f.scrollView.scrollTop < bottom);
+	assert.equal(f.scrollView.isFollowingEnd, false);
+	const top = f.scrollView.scrollTop;
+	f.chat.addChild(new Spacer(10));
+	f.tui.renderNow();
+	assert.equal(f.scrollView.scrollTop, top);
+});
+
+test("scrolling clears a clamped question/answer jump anchor", (t) => {
+	const f = fixture(t, 0, 0);
+	f.at(0);
+	f.send("9", "]", "a");
+	const clampedTop = f.scrollView.scrollTop;
+	assert(clampedTop < f.rowOf(f.answers[3]!));
+	f.send("j"); // Already at the bottom, but still exits message-jump navigation.
+	f.send("[", "q");
+	const expected = f.questions.map(f.rowOf).filter((row) => row < clampedTop).at(-1);
+	assert.equal(f.jumpedRows.at(-1), expected);
+});
+
+test("explicit-register deletion, operator j/k motions, and U undo still edit the draft", (t) => {
+	const f = fixture(t);
+	const start = f.rowOf(f.answers[1]!);
+	f.at(start);
+	f.editor.setText("one two\nthree\nfour");
+	f.editor.setCursorPosition({ line: 0, col: 0 });
+	f.send('"', '"', "d", "w");
+	assert.equal(f.editor.getText(), "two\nthree\nfour");
+	f.send("u");
+	assert.equal(f.editor.getText(), "two\nthree\nfour");
+	f.send("d", "U");
+	assert.equal(f.editor.getText(), "one two\nthree\nfour");
+	f.send("\x12");
+	assert.equal(f.editor.getText(), "two\nthree\nfour");
+	f.send("U");
+	f.send('"', '"', "d", "j");
+	assert.equal(f.editor.getText(), "four");
+	f.send("U");
+	f.send('"', "a", "d", "d");
+	assert.equal(f.editor.getText(), "three\nfour");
+	f.send("U");
+	f.editor.setCursorPosition({ line: 1, col: 0 });
+	f.send("y", "k");
+	assert.equal(f.editor.registers.get('"')?.text, "one two\nthree\n");
+	assert.equal(f.scrollView.scrollTop, start);
+	assert.equal(f.editor.operator, null);
+});
+
+test("Kitty-encoded scrolling keys and macros use the same scrolling path", (t) => {
+	const f = fixture(t);
+	const start = f.rowOf(f.answers[1]!);
+	f.at(start);
+	f.send("\x1b[106u");
+	assert.equal(f.scrollView.scrollTop, start + 1);
+	f.send("\x1b[107u");
+	assert.equal(f.scrollView.scrollTop, start);
+	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
+	f.send("\x1b[100u");
+	assert.equal(f.scrollView.scrollTop, start + halfPage);
+	f.send("\x1b[117u");
+	assert.equal(f.scrollView.scrollTop, start);
+	f.send("q", "b", "d", "q", "@", "b");
+	assert.equal(f.scrollView.scrollTop, start + 2 * halfPage);
+	assert.equal(f.editor.getText(), "draft prompt");
+});
+
+test("scrolling is safe for empty conversations and one-row viewports", (t) => {
+	const f = fixture(t);
+	f.chat.clear();
+	f.editor.setText("");
+	f.tui.renderNow();
+	f.send("j", "k", "u", "d");
+	assert.equal(f.scrollView.scrollTop, 0);
+	f.chat.addChild(new Spacer(20));
+	f.terminal.rows = 4;
+	f.tui.renderNow();
+	assert.equal(f.scrollView.viewportHeight, 1);
+	f.at(0);
+	f.send("d");
+	assert.equal(f.scrollView.scrollTop, 1);
+	f.send("u");
+	assert.equal(f.scrollView.scrollTop, 0);
+});
+
 test("gg and G jump to conversation boundaries without moving the draft cursor", (t) => {
 	const f = fixture(t);
 	const bottom = f.scrollView.scrollTop;
@@ -171,11 +309,11 @@ test("counted gg/G and operator motions still address draft lines", (t) => {
 	f.editor.setCursorPosition({ line: 0, col: 0 });
 	f.send("2", "G");
 	assert.deepEqual(f.editor.getCursorPosition(), { line: 1, col: 1 });
-	f.send("d", "g", "g");
+	f.send('"', '"', "d", "g", "g");
 	assert.equal(f.editor.getText(), "three");
 	f.editor.setText("one\n two\nthree");
 	f.editor.setCursorPosition({ line: 1, col: 0 });
-	f.send("d", "G");
+	f.send('"', '"', "d", "G");
 	assert.equal(f.editor.getText(), "one");
 	assert.equal(f.scrollView.scrollTop, top);
 	assert.equal(f.scrollView.isFollowingEnd, false);
@@ -292,8 +430,8 @@ test("insert mode types every binding literally", (t) => {
 	const f = fixture(t);
 	f.at(0);
 	f.editor.setText("");
-	f.send("i", "[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G");
-	assert.equal(f.editor.getText(), "[q[a]q]aggG");
+	f.send("i", "[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G", "j", "d", "k", "u");
+	assert.equal(f.editor.getText(), "[q[a]q]aggGjdku");
 	assert.equal(f.editor.mode, "insert");
 	assert.deepEqual(f.jumpedRows, []);
 });
@@ -308,6 +446,11 @@ test("replace, command, search, and visual modes never jump", (t) => {
 		assert.deepEqual(f.jumpedRows, [], mode);
 		assert.equal(f.scrollView.scrollTop, top, mode);
 		assert.equal(f.scrollView.isFollowingEnd, false, mode);
+		for (const key of ["j", "k", "u", "d"]) {
+			f.editor.mode = mode;
+			f.send(key);
+			assert.equal(f.scrollView.scrollTop, top, `${mode}: ${key}`);
+		}
 	}
 });
 
@@ -321,7 +464,7 @@ test("Escape and invalid suffixes cancel prefixes without triggering append or m
 	assert.equal(f.editor.getText(), "draft prompt");
 	assert.equal(f.editor.mode, "normal");
 	assert.deepEqual(f.jumpedRows, []);
-	f.send("d", "[", "q");
+	f.send('"', '"', "d", "[", "q");
 	assert.equal(f.editor.operator, null);
 	assert.equal(f.editor.recordingMacroReg, null);
 	assert.deepEqual(f.jumpedRows, []);
@@ -334,7 +477,7 @@ test("brackets remain usable as find/replace characters and text objects", (t) =
 	f.editor.setCursorPosition({ line: 0, col: 0 });
 	f.send("f", "[");
 	assert.equal(f.editor.getCursorPosition().col, 1);
-	f.send("d", "i", "[");
+	f.send('"', '"', "d", "i", "[");
 	assert.equal(f.editor.getText(), "x[]y");
 	f.editor.setCursorPosition({ line: 0, col: 1 });
 	f.send("r", "]");
@@ -357,8 +500,8 @@ test("single-key paste chunks are literal even after a pending jump prefix", (t)
 	const f = fixture(t);
 	f.at(0);
 	f.editor.setText("");
-	f.send("[", "\x1b[200~", "[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G", "\x1b[201~");
-	assert.equal(f.editor.getText(), "[q[a]q]aggG");
+	f.send("[", "\x1b[200~", "[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G", "j", "k", "u", "d", "\x1b[201~");
+	assert.equal(f.editor.getText(), "[q[a]q]aggGjkud");
 	assert.equal(f.editor.mode, "normal");
 	assert.equal(f.editor.pendingKeys, "");
 	assert.deepEqual(f.jumpedRows, []);
@@ -369,14 +512,14 @@ test("focused overlays and autocomplete retain ownership of typing", (t) => {
 	f.at(0);
 	const input = new Input();
 	const overlay = f.tui.showOverlay(input);
-	f.send("[", "q", "]", "a", "g", "g", "G");
-	assert.equal(input.getValue(), "[q]aggG");
+	f.send("[", "q", "]", "a", "g", "g", "G", "j", "k", "u", "d");
+	assert.equal(input.getValue(), "[q]aggGjkud");
 	assert.deepEqual(f.jumpedRows, []);
 	overlay.hide();
 	f.editor.setText("");
 	f.editor.isShowingAutocomplete = () => true;
-	f.send("[", "q", "]", "a", "g", "g", "G");
-	assert.equal(f.editor.getText(), "[q]aggG");
+	f.send("[", "q", "]", "a", "g", "g", "G", "j", "k", "u", "d");
+	assert.equal(f.editor.getText(), "[q]aggGjkud");
 	assert.deepEqual(f.jumpedRows, []);
 });
 
@@ -390,5 +533,10 @@ test("regular mode and missing fullscreen layouts safely consume the bindings", 
 		assert.equal(editor.mode, "normal");
 		assert.equal(editor.pendingKeys, "");
 		assert.equal(editor.recordingMacroReg, null);
+		if (mode === "fullscreen") {
+			for (const key of ["j", "k", "u", "d"]) editor.handleInput(key);
+			assert.equal(editor.getText(), "draft");
+			assert.equal(editor.operator, null);
+		}
 	}
 });

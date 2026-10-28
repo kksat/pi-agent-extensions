@@ -1489,6 +1489,19 @@ export class VimEditor extends CustomEditor {
 				return;
 			}
 
+			// Fullscreen Normal mode browses the conversation. An explicit register
+			// keeps d available as a draft operator without making repeated d destructive.
+			if (this.tui.mode === "fullscreen" && !this.operator && !this.selectedRegister) {
+				const down = matchesKey(data, "j") || matchesKey(data, "d");
+				const up = matchesKey(data, "k") || matchesKey(data, "u");
+				if (down || up) {
+					const unit = matchesKey(data, "j") || matchesKey(data, "k") ? "line" : "halfPage";
+					this.transcriptNavigator.scroll(down ? 1 : -1, unit, this.getCount());
+					this.resetPending();
+					return;
+				}
+			}
+
 			// Operators: d, c, y, >, <, =
 			if (data === "d" || data === "c" || data === "y" || data === ">" || data === "<" || data === "=") {
 				if (this.operator === data) {
@@ -1764,7 +1777,7 @@ export class VimEditor extends CustomEditor {
 			}
 
 			// Undo & Redo
-			if (data === "u") {
+			if (data === "u" || matchesKey(data, "shift+u")) {
 				this.pushRedo();
 				(this as any).undo();
 				this.setCursorPosition(this.getCursorPosition());
@@ -2539,10 +2552,10 @@ export default function (pi: ExtensionAPI) {
 					"Vim Mode Reference:\n\n" +
 						"Modes: Normal (Esc), Insert (i, a, o, s, C), Visual (v, V, Ctrl+V), Replace (R)\n" +
 						"Motions: h/j/k/l, w/b/e/ge, 0/^/$, Ngg/NG (draft line N), f/F/t/T, %, {/}, H/M/L\n" +
-						"Conversation (Normal, fullscreen): gg/G start/end, [q/]q previous/next user question, [a/]a previous/next assistant answer\n" +
+						"Conversation (Normal, fullscreen): j/k line down/up, d/u half-page down/up, gg/G start/end, [q/]q previous/next user question, [a/]a previous/next assistant answer\n" +
 						"Text Objects: iw/aw, i\"/a\", i(/a(, i[/a[, i{/a{, i</a<, ip/ap\n" +
-						"Operators: d (delete), c (change), y (yank), > (indent), < (unindent)\n" +
-						"Editing: x/X, r, ~, J, p/P, u, Ctrl+R, . (repeat)\n" +
+						"Operators: \"\"d (delete in fullscreen), c (change), y (yank), > (indent), < (unindent)\n" +
+						"Editing: x/X, r, ~, J, p/P, U (undo), Ctrl+R, . (repeat)\n" +
 						"Marks & Macros: m{a-z}, '{a-z}, q{a-z}, @{a-z}, @@\n" +
 						"Ex Commands: :%s/old/new/g, :quote, :unquote, :fence [lang], :reflow 80, :w (submit), :q (exit), :noh\n" +
 						"Fast exit: jk or jj in Insert mode",

@@ -73,6 +73,18 @@ export class TranscriptNavigator {
 		this.tui = tui;
 	}
 
+	/** Scrolls by count lines or half-pages, using the current transcript viewport height. */
+	scroll(direction: Direction, unit: "line" | "halfPage", count = 1): void {
+		if (this.tui.mode !== "fullscreen") return;
+		const scrollView = (this.tui as TranscriptTUI).currentLayout?.primaryScrollView;
+		if (!scrollView) return;
+
+		const step = unit === "line" ? 1 : Math.max(1, Math.floor(scrollView.viewportHeight / 2));
+		this.lastJump = undefined;
+		scrollView.scrollBy(direction * step * count);
+		this.tui.requestRender();
+	}
+
 	/** Scrolls to the transcript start or end; the end resumes following new output. */
 	jumpToBoundary(boundary: "start" | "end"): void {
 		if (this.tui.mode !== "fullscreen") return;
