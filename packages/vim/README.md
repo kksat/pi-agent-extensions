@@ -9,7 +9,7 @@ Replaces Pi's main input editor with an authentic, prompt-optimized Vim modal ed
 - **Modes**: `NORMAL`, `INSERT`, `VISUAL` (char), `V-LINE` (linewise), `V-BLOCK` (rectangular block), `REPLACE`, `COMMAND` (`:`), `SEARCH` (`/`)
 - **Motions**: `h`, `j`, `k`, `l`, `w`, `W`, `b`, `B`, `e`, `E`, `ge`, `gE`, `0`, `^`, `$`, `gg`, `G`, `f{c}`, `F{c}`, `t{c}`, `T{c}`, `;`, `,`, `%`, `{`, `}`, `H`, `M`, `L`, `Ctrl+D`, `Ctrl+U`, `Ctrl+F`, `Ctrl+B`
 - **Text Objects**: `iw`, `aw`, `iW`, `aW`, `i"`, `a"`, `i'`, `a'`, `i\``, `a\``, `i(`, `a(`, `ib`, `ab`, `i[`, `a[`, `i{`, `a{`, `iB`, `aB`, `i<`, `a<`, `ip`, `ap`
-- **Operators**: `d` (delete; requires a register prefix in fullscreen Normal mode), `c` (change), `y` (yank), `>` (indent), `<` (unindent), `g~` (toggle case), `gu` (lowercase), `gU` (uppercase) + line doubling (`dd`, `cc`, `yy`, `>>`, `<<`)
+- **Operators**: `d` (delete; lone `d` scrolls after 300 ms in fullscreen Normal mode), `c` (change), `y` (yank), `>` (indent), `<` (unindent), `g~` (toggle case), `gu` (lowercase), `gU` (uppercase) + line doubling (`dd`, `cc`, `yy`, `>>`, `<<`)
 - **Editing Actions**: `i`, `I`, `a`, `A`, `o`, `O`, `s`, `S`, `C`, `D`, `x`, `X`, `r{c}`, `R`, `~`, `J`, `p`, `P`, `U` (undo), `Ctrl+R`, `.` (dot repeat)
 - **Prompt-Native Ex Commands**:
   - `:%s/old/new/g` or `:s/old/new/g` — regex & string search and replace
@@ -92,7 +92,7 @@ In Pi's fullscreen view, press these key sequences in **Normal mode** to scroll 
 | Keys | Action |
 |---|---|
 | `j` / `k` | Scroll down / up by one line |
-| `d` / `u` | Scroll down / up by half the transcript viewport height |
+| `d` / `u` | Scroll down / up by half the transcript viewport height; lone `d` waits 300 ms |
 | `gg` | Jump to the start of the conversation |
 | `G` | Jump to the end and follow new output |
 | `[q` | Jump to the previous user question |
@@ -108,15 +108,19 @@ Counts also apply to scrolling: `3j` scrolls three lines and `2d` scrolls two
 half-pages. Half-page steps adapt to the transcript viewport height. Scrolling
 down to the end resumes following new output; scrolling up pauses following.
 
-Fullscreen Normal mode reserves bare `d` and `u` for scrolling. Use `U` to undo.
-For deletion, select an explicit register: `""dw` deletes a word, `""dd` deletes a
-line, and `"adw` deletes a word into register `a`. You can also use `:d` to delete
-a line. Operator-pending `j` and `k` still address draft lines, so `""dj` deletes
-two lines and `yj` yanks two lines. Visual-mode editing stays unchanged.
+In fullscreen Normal mode, `d` waits 300 ms for a delete continuation. Press the
+next key within that interval: `dd` deletes a line, `dw` deletes a word, and `2dd`
+deletes two lines. A delete continuation cancels the delayed scroll. If no key
+follows, `d` scrolls down half a page. `Esc` cancels a pending `d` without scrolling.
+Selecting an explicit register, as in `""dd` or `"adw`, starts deletion without a
+timeout. Use `U` to undo; bare `u` scrolls up.
+
+Operator-pending `j` and `k` still address draft lines, so `dj` deletes two lines
+and `yj` yanks two lines. Visual-mode editing stays unchanged.
 
 Bare `gg` and `G` navigate the conversation. Counted forms such as `2gg` and `2G`
-still move to a draft line, and operator motions such as `""dgg` and `""dG` still
-edit the draft. `Esc` cancels a pending `g`, `[`, or `]` prefix.
+still move to a draft line, and operator motions such as `dgg` and `dG` still edit
+the draft. `Esc` cancels a pending `g`, `[`, or `]` prefix.
 
 In Insert mode, these sequences are ordinary text. They don't navigate in Replace,
 Visual, Search, or Command modes, or while autocomplete or an overlay owns input.

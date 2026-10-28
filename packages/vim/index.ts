@@ -727,6 +727,10 @@ function setSystemClipboard(text: string): void {
 // Vim Editor Implementation
 // ---------------------------------------------------------------------------
 
+const DELETE_SCROLL_DELAY_MS = 300;
+// Macro replay has no timing, so record completed single-d scrolls explicitly.
+const DELETE_SCROLL_MACRO_KEY = "\x1b_pi-vim:scroll-d\x07";
+
 export class VimEditor extends CustomEditor {
 	public mode: VimMode = "normal";
 	public visualAnchor: Position = { line: 0, col: 0 };
@@ -754,6 +758,7 @@ export class VimEditor extends CustomEditor {
 	private config: VimConfig;
 	private vimTheme: EditorTheme;
 	private transcriptNavigator: TranscriptNavigator;
+	private pendingDeleteTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) {
 		super(tui, theme, keybindings);
@@ -830,7 +835,25 @@ export class VimEditor extends CustomEditor {
 		return null;
 	}
 
+	private cancelDeleteTimer(): void {
+		if (this.pendingDeleteTimer !== undefined) {
+			clearTimeout(this.pendingDeleteTimer);
+			this.pendingDeleteTimer = undefined;
+		}
+	}
+
+	private scrollPendingDelete(): void {
+		const count = this.getCount();
+		const canScroll = this.mode === "normal" && this.focused && !this.isShowingAutocomplete();
+		this.resetPending();
+		if (canScroll) {
+			if (this.recordingMacroReg) this.recordedMacroKeys.push(DELETE_SCROLL_MACRO_KEY);
+			this.transcriptNavigator.scroll(1, "halfPage", count);
+		}
+	}
+
 	public resetPending(): void {
+		this.cancelDeleteTimer();
 		this.operator = null;
 		this.countStr = "";
 		this.operatorCountStr = "";
@@ -879,10 +902,30 @@ export class VimEditor extends CustomEditor {
 			return;
 		}
 
+		if (data === DELETE_SCROLL_MACRO_KEY) {
+			if (this.pendingDeleteTimer !== undefined) this.scrollPendingDelete();
+			return;
+		}
+
 		// Macro recording capture (q in [q / ]q isn't the stop command).
 		if (this.recordingMacroReg &&
 			(data !== "q" || this.pendingKeys === "[" || this.pendingKeys === "]")) {
 			this.recordedMacroKeys.push(data);
+		}
+
+		if (this.pendingDeleteTimer !== undefined) {
+			this.cancelDeleteTimer();
+			if (this.mode !== "normal" || this.isShowingAutocomplete()) {
+				this.resetPending();
+			} else if (!matchesKey(data, "escape")) {
+				// A delete continuation wins over the delayed single-d scroll. Other
+				// keys finish the scroll first, then run as independent commands.
+				if (matchesKey(data, "d")) data = "d";
+				const continuesDelete = /^[1-9]$/.test(data) ||
+					["d", "i", "a", "g", "f", "F", "t", "T"].includes(data) ||
+					this.evalMotion(data) !== null;
+				if (!continuesDelete) this.scrollPendingDelete();
+			}
 		}
 
 		// 1. If autocomplete popup is active, delegate all navigation to default editor
@@ -1489,10 +1532,10 @@ export class VimEditor extends CustomEditor {
 				return;
 			}
 
-			// Fullscreen Normal mode browses the conversation. An explicit register
-			// keeps d available as a draft operator without making repeated d destructive.
+			// Fullscreen Normal mode browses the conversation. d is handled below
+			// as a delete prefix with a delayed scroll when no continuation follows.
 			if (this.tui.mode === "fullscreen" && !this.operator && !this.selectedRegister) {
-				const down = matchesKey(data, "j") || matchesKey(data, "d");
+				const down = matchesKey(data, "j");
 				const up = matchesKey(data, "k") || matchesKey(data, "u");
 				if (down || up) {
 					const unit = matchesKey(data, "j") || matchesKey(data, "k") ? "line" : "halfPage";
@@ -1503,6 +1546,7 @@ export class VimEditor extends CustomEditor {
 			}
 
 			// Operators: d, c, y, >, <, =
+			if (matchesKey(data, "d")) data = "d";
 			if (data === "d" || data === "c" || data === "y" || data === ">" || data === "<" || data === "=") {
 				if (this.operator === data) {
 					// Doubled operator: dd, cc, yy, >>, <<
@@ -1516,6 +1560,10 @@ export class VimEditor extends CustomEditor {
 				this.operator = data;
 				this.operatorCountStr = this.countStr;
 				this.countStr = "";
+				if (data === "d" && this.tui.mode === "fullscreen" && !this.selectedRegister) {
+					this.pendingDeleteTimer = setTimeout(() => this.scrollPendingDelete(), DELETE_SCROLL_DELAY_MS);
+					this.pendingDeleteTimer.unref?.();
+				}
 				this.tui.requestRender();
 				return;
 			}
@@ -2498,15 +2546,22 @@ export class VimEditor extends CustomEditor {
 
 export default function (pi: ExtensionAPI) {
 	let config = loadConfig();
+	let editor: VimEditor | undefined;
 
 	const enableVim = (ctx: any) => {
+		editor?.resetPending();
 		ctx.ui.setEditorComponent(
-			(tui: TUI, theme: EditorTheme, kb: KeybindingsManager) =>
-				new VimEditor(tui, theme, kb),
+			(tui: TUI, theme: EditorTheme, kb: KeybindingsManager) => {
+				editor?.resetPending();
+				editor = new VimEditor(tui, theme, kb);
+				return editor;
+			},
 		);
 	};
 
 	const disableVim = (ctx: any) => {
+		editor?.resetPending();
+		editor = undefined;
 		resetTerminalCursorShape();
 		ctx.ui.setEditorComponent(undefined);
 	};
@@ -2519,6 +2574,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		editor?.resetPending();
 		resetTerminalCursorShape();
 	});
 
@@ -2554,7 +2610,7 @@ export default function (pi: ExtensionAPI) {
 						"Motions: h/j/k/l, w/b/e/ge, 0/^/$, Ngg/NG (draft line N), f/F/t/T, %, {/}, H/M/L\n" +
 						"Conversation (Normal, fullscreen): j/k line down/up, d/u half-page down/up, gg/G start/end, [q/]q previous/next user question, [a/]a previous/next assistant answer\n" +
 						"Text Objects: iw/aw, i\"/a\", i(/a(, i[/a[, i{/a{, i</a<, ip/ap\n" +
-						"Operators: \"\"d (delete in fullscreen), c (change), y (yank), > (indent), < (unindent)\n" +
+						"Operators: d (delete; lone d scrolls after 300 ms), c (change), y (yank), > (indent), < (unindent)\n" +
 						"Editing: x/X, r, ~, J, p/P, U (undo), Ctrl+R, . (repeat)\n" +
 						"Marks & Macros: m{a-z}, '{a-z}, q{a-z}, @{a-z}, @@\n" +
 						"Ex Commands: :%s/old/new/g, :quote, :unquote, :fence [lang], :reflow 80, :w (submit), :q (exit), :noh\n" +

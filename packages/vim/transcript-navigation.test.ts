@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
 */
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AssistantMessageComponent, UserMessageComponent, initTheme, type KeybindingsManager as EditorKeybindingsManager } from "@earendil-works/pi-coding-agent";
 import {
@@ -59,7 +59,8 @@ function answer(text: string, toolCall = false): AssistantMessageComponent {
 	return new AssistantMessageComponent(message, true);
 }
 
-function fixture(t: { after(fn: () => void): void }, spacing = 12, tail = 30) {
+function fixture(t: TestContext, spacing = 12, tail = 30) {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const terminal = new TestTerminal();
 	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: false });
 	// The editor only needs matches/getKeys, not Pi's config-file reload methods.
@@ -89,7 +90,10 @@ function fixture(t: { after(fn: () => void): void }, spacing = 12, tail = 30) {
 	]));
 	tui.setFocus(editor);
 	tui.start();
-	t.after(() => tui.stop());
+	t.after(() => {
+		editor.resetPending();
+		tui.stop();
+	});
 	tui.renderNow();
 	const jumpedRows: number[] = [];
 	const scrollTo = scrollView.scrollTo.bind(scrollView);
@@ -117,8 +121,124 @@ function fixture(t: { after(fn: () => void): void }, spacing = 12, tail = 30) {
 		tui.renderNow();
 		jumpedRows.length = 0;
 	};
-	return { terminal, tui, editor, chat, questions, answers, scrollView, jumpedRows, rowOf, send, at };
+	const advance = (milliseconds = 300) => {
+		t.mock.timers.tick(milliseconds);
+		tui.renderNow();
+	};
+	return { terminal, tui, editor, chat, questions, answers, scrollView, jumpedRows, rowOf, send, at, advance };
 }
+
+test("dd deletes the current draft line without scrolling the conversation", (t) => {
+	const f = fixture(t);
+	f.editor.setText("first\nsecond\nthird");
+	f.editor.setCursorPosition({ line: 1, col: 2 });
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	f.send("d", "d");
+	assert.equal(f.editor.getText(), "first\nthird");
+	assert.equal(f.scrollView.scrollTop, top);
+	assert.equal(f.editor.operator, null);
+});
+
+test("single d scrolls only after 300 ms and dd cancels the fallback scroll", (t) => {
+	const f = fixture(t);
+	f.editor.setText("first\nsecond\nthird");
+	f.editor.setCursorPosition({ line: 1, col: 0 });
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	f.send("d");
+	f.advance(299);
+	assert.equal(f.scrollView.scrollTop, top);
+	f.send("d");
+	f.advance(1000);
+	assert.equal(f.editor.getText(), "first\nthird");
+	assert.equal(f.scrollView.scrollTop, top);
+	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
+	f.send("d");
+	f.advance(299);
+	assert.equal(f.scrollView.scrollTop, top);
+	f.advance(1);
+	assert.equal(f.scrollView.scrollTop, top + halfPage);
+	assert.equal(f.editor.getText(), "first\nthird");
+	assert.equal(f.editor.operator, null);
+});
+
+test("bare delete continuations and counts operate on the draft without scrolling", (t) => {
+	const f = fixture(t);
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	f.editor.setText("one two\nsecond\nthird\nfourth");
+	f.editor.setCursorPosition({ line: 0, col: 0 });
+	f.send("d", "w");
+	assert.equal(f.editor.getText(), "two\nsecond\nthird\nfourth");
+	f.send("2", "d", "d");
+	assert.equal(f.editor.getText(), "third\nfourth");
+	f.send("d", "i");
+	f.advance(1000); // Once a delete continuation starts, later keys need no deadline.
+	f.send("w");
+	assert.equal(f.editor.getText(), "\nfourth");
+	f.advance(1000);
+	assert.equal(f.scrollView.scrollTop, top);
+	assert.equal(f.editor.operator, null);
+});
+
+test("Kitty-encoded dd deletes a line and leaves no delayed scroll", (t) => {
+	const f = fixture(t);
+	f.editor.setText("first\nsecond");
+	f.editor.setCursorPosition({ line: 0, col: 0 });
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	f.send("\x1b[100u", "\x1b[100u");
+	f.advance(1000);
+	assert.equal(f.editor.getText(), "second");
+	assert.equal(f.scrollView.scrollTop, top);
+});
+
+test("Escape, paste, mode changes, and lost focus cancel pending d scrolling", (t) => {
+	const f = fixture(t);
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	let escaped = 0;
+	f.editor.onEscape = () => { escaped++; };
+	f.send("d", "\x1b");
+	f.advance(1000);
+	assert.equal(escaped, 0, "Escape cancels the prefix instead of aborting the agent");
+	assert.equal(f.editor.operator, null);
+	assert.equal(f.scrollView.scrollTop, top);
+	f.send("d", "\x1b[200~literal\x1b[201~");
+	const pasted = f.editor.getText();
+	f.advance(1000);
+	assert.equal(f.editor.getText(), pasted);
+	assert.equal(f.scrollView.scrollTop, top);
+	f.send("d");
+	f.editor.enterInsertMode();
+	f.advance(1000);
+	assert.equal(f.scrollView.scrollTop, top);
+	f.editor.mode = "normal";
+	f.send("d");
+	const overlay = f.tui.showOverlay(new Input());
+	f.advance(1000);
+	assert.equal(f.scrollView.scrollTop, top);
+	assert.equal(f.editor.operator, null);
+	overlay.hide();
+});
+
+test("macros distinguish two single-d scrolls from dd deletion", (t) => {
+	const f = fixture(t);
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
+	f.send("q", "b", "d");
+	f.advance();
+	f.send("d");
+	f.advance();
+	f.send("q");
+	f.at(top);
+	f.send("@", "b");
+	f.advance();
+	assert.equal(f.editor.getText(), "draft prompt");
+	assert.equal(f.scrollView.scrollTop, top + 2 * halfPage);
+});
 
 test("j/k scroll by lines and u/d by half-pages without editing the draft", (t) => {
 	const f = fixture(t);
@@ -133,8 +253,10 @@ test("j/k scroll by lines and u/d by half-pages without editing the draft", (t) 
 	f.send("k");
 	assert.equal(f.scrollView.scrollTop, start);
 	f.send("d");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, start + halfPage);
 	f.send("d");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, start + 2 * halfPage);
 	f.send("u", "u");
 	assert.equal(f.scrollView.scrollTop, start);
@@ -158,6 +280,7 @@ test("scroll counts reset and half-pages track resized transcript height", (t) =
 	f.tui.renderNow();
 	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
 	f.send("2", "d");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, start + 1 + 2 * halfPage);
 	f.send("u");
 	assert.equal(f.scrollView.scrollTop, start + 1 + halfPage);
@@ -171,6 +294,7 @@ test("scrolling clamps to boundaries and resumes following output at the end", (
 	f.send("k", "u");
 	assert.equal(f.scrollView.scrollTop, 0);
 	f.send("9", "9", "9", "d");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, bottom);
 	assert.equal(f.scrollView.isFollowingEnd, true);
 	f.send("u");
@@ -232,10 +356,12 @@ test("Kitty-encoded scrolling keys and macros use the same scrolling path", (t) 
 	assert.equal(f.scrollView.scrollTop, start);
 	const halfPage = Math.max(1, Math.floor(f.scrollView.viewportHeight / 2));
 	f.send("\x1b[100u");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, start + halfPage);
 	f.send("\x1b[117u");
 	assert.equal(f.scrollView.scrollTop, start);
 	f.send("q", "b", "d", "q", "@", "b");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, start + 2 * halfPage);
 	assert.equal(f.editor.getText(), "draft prompt");
 });
@@ -246,6 +372,7 @@ test("scrolling is safe for empty conversations and one-row viewports", (t) => {
 	f.editor.setText("");
 	f.tui.renderNow();
 	f.send("j", "k", "u", "d");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, 0);
 	f.chat.addChild(new Spacer(20));
 	f.terminal.rows = 4;
@@ -253,6 +380,7 @@ test("scrolling is safe for empty conversations and one-row viewports", (t) => {
 	assert.equal(f.scrollView.viewportHeight, 1);
 	f.at(0);
 	f.send("d");
+	f.advance();
 	assert.equal(f.scrollView.scrollTop, 1);
 	f.send("u");
 	assert.equal(f.scrollView.scrollTop, 0);
@@ -309,11 +437,11 @@ test("counted gg/G and operator motions still address draft lines", (t) => {
 	f.editor.setCursorPosition({ line: 0, col: 0 });
 	f.send("2", "G");
 	assert.deepEqual(f.editor.getCursorPosition(), { line: 1, col: 1 });
-	f.send('"', '"', "d", "g", "g");
+	f.send("d", "g", "g");
 	assert.equal(f.editor.getText(), "three");
 	f.editor.setText("one\n two\nthree");
 	f.editor.setCursorPosition({ line: 1, col: 0 });
-	f.send('"', '"', "d", "G");
+	f.send("d", "G");
 	assert.equal(f.editor.getText(), "one");
 	assert.equal(f.scrollView.scrollTop, top);
 	assert.equal(f.scrollView.isFollowingEnd, false);
@@ -477,7 +605,7 @@ test("brackets remain usable as find/replace characters and text objects", (t) =
 	f.editor.setCursorPosition({ line: 0, col: 0 });
 	f.send("f", "[");
 	assert.equal(f.editor.getCursorPosition().col, 1);
-	f.send('"', '"', "d", "i", "[");
+	f.send("d", "i", "[");
 	assert.equal(f.editor.getText(), "x[]y");
 	f.editor.setCursorPosition({ line: 0, col: 1 });
 	f.send("r", "]");
@@ -523,7 +651,8 @@ test("focused overlays and autocomplete retain ownership of typing", (t) => {
 	assert.deepEqual(f.jumpedRows, []);
 });
 
-test("regular mode and missing fullscreen layouts safely consume the bindings", () => {
+test("regular mode and missing fullscreen layouts safely consume the bindings", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	for (const mode of ["regular", "fullscreen"] as const) {
 		const tui = { mode, terminal: new TestTerminal(), requestRender() {} };
 		const editor = new VimEditor(tui as unknown as TuiAltScreen, editorTheme, new KeybindingsManager({}) as EditorKeybindingsManager);
@@ -535,6 +664,7 @@ test("regular mode and missing fullscreen layouts safely consume the bindings", 
 		assert.equal(editor.recordingMacroReg, null);
 		if (mode === "fullscreen") {
 			for (const key of ["j", "k", "u", "d"]) editor.handleInput(key);
+			t.mock.timers.tick(300);
 			assert.equal(editor.getText(), "draft");
 			assert.equal(editor.operator, null);
 		}
