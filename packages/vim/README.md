@@ -83,6 +83,27 @@ pi -e ~/dev/pi-agent-extensions/packages/vim
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `Ctrl+F` / `Ctrl+B` | Page down / up |
 
+### Conversation navigation
+
+In Pi's fullscreen view, press these key sequences in **Normal mode** to scroll to message starts:
+
+| Keys | Action |
+|---|---|
+| `[q` | Jump to the previous user question |
+| `]q` | Jump to the next user question |
+| `[a` | Jump to the previous assistant answer |
+| `]a` | Jump to the next assistant answer |
+
+Jumps start from the top of the transcript viewport and skip tool calls and results.
+A count repeats the jump: `2[q` moves back two questions. Jumps stop at the first
+or last matching message without wrapping and leave your draft and editor cursor
+unchanged. `Esc` cancels a pending `[` or `]` prefix.
+
+In Insert mode, these sequences are ordinary text. They don't navigate in Replace,
+Visual, Search, or Command modes, or while autocomplete or an overlay owns input.
+Pasted sequences remain literal text. Regular mode uses terminal-owned scrollback,
+so these jumps require fullscreen mode.
+
 ### Text Objects (use with `d`, `c`, `y`, `v`)
 
 | Text Object | Description |

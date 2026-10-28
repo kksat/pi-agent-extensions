@@ -29,9 +29,10 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { EditorTheme, KeybindingsManager, TUI } from "@earendil-works/pi-tui";
+import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
+import { TranscriptNavigator } from "./transcript-navigation.ts";
 
 // ---------------------------------------------------------------------------
 // Types & Configuration
@@ -752,10 +753,12 @@ export class VimEditor extends CustomEditor {
 	private lastInsertTime = 0;
 	private config: VimConfig;
 	private vimTheme: EditorTheme;
+	private transcriptNavigator: TranscriptNavigator;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) {
 		super(tui, theme, keybindings);
 		this.vimTheme = theme;
+		this.transcriptNavigator = new TranscriptNavigator(tui);
 		this.config = loadConfig();
 		this.mode = this.config.startMode || "normal";
 		setTerminalCursorShape(this.mode, this.config.cursorShape);
@@ -868,8 +871,17 @@ export class VimEditor extends CustomEditor {
 	}
 
 	handleInput(data: string): void {
-		// Macro recording capture
-		if (this.recordingMacroReg && data !== "q") {
+		// Paste payloads are text, even when split into individual Vim command keys.
+		if ((this as any).isInPaste || data.includes("\x1b[200~")) {
+			if (this.recordingMacroReg) this.recordedMacroKeys.push(data);
+			this.resetPending();
+			super.handleInput(data);
+			return;
+		}
+
+		// Macro recording capture (q in [q / ]q isn't the stop command).
+		if (this.recordingMacroReg &&
+			(data !== "q" || this.pendingKeys === "[" || this.pendingKeys === "]")) {
 			this.recordedMacroKeys.push(data);
 		}
 
@@ -1197,6 +1209,19 @@ export class VimEditor extends CustomEditor {
 				return;
 			}
 
+			// Conversation jumps must consume q/a before macro recording or append.
+			if (this.pendingKeys === "[" || this.pendingKeys === "]") {
+				const direction = this.pendingKeys === "[" ? -1 : 1;
+				const count = this.getCount();
+				const canJump = !this.operator;
+				this.resetPending();
+				if (canJump && (matchesKey(data, "q") || matchesKey(data, "a"))) {
+					this.transcriptNavigator.jump(matchesKey(data, "q") ? "user" : "assistant", direction, count);
+				}
+				this.tui.requestRender();
+				return;
+			}
+
 			// Text object pending (i / a after operator) - highest priority
 			if (
 				(this.pendingKeys === "i" || this.pendingKeys === "a") &&
@@ -1443,6 +1468,13 @@ export class VimEditor extends CustomEditor {
 					this.resetPending();
 					return;
 				}
+			}
+
+			// Conversation jump prefix (normal mode only, not an editor motion).
+			if (matchesKey(data, "[") || matchesKey(data, "]")) {
+				this.pendingKeys = matchesKey(data, "[") ? "[" : "]";
+				this.tui.requestRender();
+				return;
 			}
 
 			// Operators: d, c, y, >, <, =
@@ -2495,6 +2527,7 @@ export default function (pi: ExtensionAPI) {
 					"Vim Mode Reference:\n\n" +
 						"Modes: Normal (Esc), Insert (i, a, o, s, C), Visual (v, V, Ctrl+V), Replace (R)\n" +
 						"Motions: h/j/k/l, w/b/e/ge, 0/^/$, gg/G, f/F/t/T, %, {/}, H/M/L\n" +
+						"Conversation (Normal, fullscreen): [q/]q previous/next user question, [a/]a previous/next assistant answer\n" +
 						"Text Objects: iw/aw, i\"/a\", i(/a(, i[/a[, i{/a{, i</a<, ip/ap\n" +
 						"Operators: d (delete), c (change), y (yank), > (indent), < (unindent)\n" +
 						"Editing: x/X, r, ~, J, p/P, u, Ctrl+R, . (repeat)\n" +
