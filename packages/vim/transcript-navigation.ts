@@ -64,13 +64,25 @@ function getMessageStarts(document: Component, width: number): MessageStart[] {
 	return starts;
 }
 
-/** Jumps between rendered user questions and assistant answers in fullscreen mode. */
+/** Navigates the conversation transcript in fullscreen mode. */
 export class TranscriptNavigator {
 	private lastJump?: { scrollView: ScrollView; component: Component; scrollTop: number };
 	private tui: TUI;
 
 	constructor(tui: TUI) {
 		this.tui = tui;
+	}
+
+	/** Scrolls to the transcript start or end; the end resumes following new output. */
+	jumpToBoundary(boundary: "start" | "end"): void {
+		if (this.tui.mode !== "fullscreen") return;
+		const scrollView = (this.tui as TranscriptTUI).currentLayout?.primaryScrollView;
+		if (!scrollView) return;
+
+		this.lastJump = undefined;
+		if (boundary === "start") scrollView.scrollToStart();
+		else scrollView.scrollToEnd();
+		this.tui.requestRender();
 	}
 
 	/** Moves by up to count matching messages; does nothing at a transcript boundary. */

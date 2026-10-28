@@ -120,6 +120,80 @@ function fixture(t: { after(fn: () => void): void }, spacing = 12, tail = 30) {
 	return { terminal, tui, editor, chat, questions, answers, scrollView, jumpedRows, rowOf, send, at };
 }
 
+test("gg and G jump to conversation boundaries without moving the draft cursor", (t) => {
+	const f = fixture(t);
+	const bottom = f.scrollView.scrollTop;
+	f.at(f.rowOf(f.answers[1]!));
+	const cursor = f.editor.getCursorPosition();
+	f.send("g");
+	assert.equal(f.editor.pendingKeys, "g");
+	assert.equal(f.scrollView.scrollTop, f.rowOf(f.answers[1]!));
+	f.send("g");
+	assert.equal(f.scrollView.scrollTop, 0);
+	assert.equal(f.scrollView.isFollowingEnd, false);
+	f.send("G");
+	assert.equal(f.scrollView.scrollTop, bottom);
+	assert.equal(f.scrollView.isFollowingEnd, true);
+	assert.equal(f.editor.getText(), "draft prompt");
+	assert.deepEqual(f.editor.getCursorPosition(), cursor);
+	assert.equal(f.editor.mode, "normal");
+	assert.equal(f.editor.pendingKeys, "");
+
+	// G follows streamed output; gg clears any role-jump anchor.
+	f.chat.addChild(new Spacer(10));
+	f.tui.renderNow();
+	assert.equal(f.scrollView.scrollTop, bottom + 10);
+	f.send("[", "a", "g", "g", "]", "q");
+	assert.equal(f.scrollView.scrollTop, f.rowOf(f.questions[0]!));
+});
+
+test("gg and G handle empty conversations and cancelled g prefixes", (t) => {
+	const f = fixture(t);
+	f.at(f.rowOf(f.answers[1]!));
+	f.send("g", "\x1b");
+	assert.equal(f.scrollView.scrollTop, f.rowOf(f.answers[1]!));
+	assert.equal(f.editor.pendingKeys, "");
+	f.chat.clear();
+	f.tui.renderNow();
+	f.send("g", "g", "G");
+	assert.equal(f.scrollView.scrollTop, 0);
+	assert.equal(f.editor.getText(), "draft prompt");
+});
+
+test("counted gg/G and operator motions still address draft lines", (t) => {
+	const f = fixture(t);
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
+	f.editor.setText("one\n two\nthree");
+	f.editor.setCursorPosition({ line: 2, col: 0 });
+	f.send("2", "g", "g");
+	assert.deepEqual(f.editor.getCursorPosition(), { line: 1, col: 1 });
+	f.editor.setCursorPosition({ line: 0, col: 0 });
+	f.send("2", "G");
+	assert.deepEqual(f.editor.getCursorPosition(), { line: 1, col: 1 });
+	f.send("d", "g", "g");
+	assert.equal(f.editor.getText(), "three");
+	f.editor.setText("one\n two\nthree");
+	f.editor.setCursorPosition({ line: 1, col: 0 });
+	f.send("d", "G");
+	assert.equal(f.editor.getText(), "one");
+	assert.equal(f.scrollView.scrollTop, top);
+	assert.equal(f.scrollView.isFollowingEnd, false);
+	assert.equal(f.editor.operator, null);
+	assert.equal(f.editor.countStr, "");
+});
+
+test("Kitty-encoded gg and G navigate conversation boundaries", (t) => {
+	const f = fixture(t);
+	const bottom = f.scrollView.scrollTop;
+	f.at(f.rowOf(f.answers[1]!));
+	f.send("\x1b[103u", "\x1b[103u");
+	assert.equal(f.scrollView.scrollTop, 0);
+	f.send("\x1b[103;2u");
+	assert.equal(f.scrollView.scrollTop, bottom);
+	assert.equal(f.scrollView.isFollowingEnd, true);
+});
+
 test("all four normal-mode bindings jump by role without changing the draft or mode", (t) => {
 	const f = fixture(t);
 	f.at(f.rowOf(f.answers[1]!));
@@ -218,19 +292,22 @@ test("insert mode types every binding literally", (t) => {
 	const f = fixture(t);
 	f.at(0);
 	f.editor.setText("");
-	f.send("i", "[", "q", "[", "a", "]", "q", "]", "a");
-	assert.equal(f.editor.getText(), "[q[a]q]a");
+	f.send("i", "[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G");
+	assert.equal(f.editor.getText(), "[q[a]q]aggG");
 	assert.equal(f.editor.mode, "insert");
 	assert.deepEqual(f.jumpedRows, []);
 });
 
 test("replace, command, search, and visual modes never jump", (t) => {
 	const f = fixture(t);
-	f.at(0);
+	f.at(f.rowOf(f.answers[1]!));
+	const top = f.scrollView.scrollTop;
 	for (const mode of ["replace", "command", "search", "visual", "visual_line", "visual_block"] satisfies VimMode[]) {
 		f.editor.mode = mode;
-		f.send("[", "q", "]", "q");
+		f.send("[", "q", "]", "q", "g", "g", "G");
 		assert.deepEqual(f.jumpedRows, [], mode);
+		assert.equal(f.scrollView.scrollTop, top, mode);
+		assert.equal(f.scrollView.isFollowingEnd, false, mode);
 	}
 });
 
@@ -280,8 +357,8 @@ test("single-key paste chunks are literal even after a pending jump prefix", (t)
 	const f = fixture(t);
 	f.at(0);
 	f.editor.setText("");
-	f.send("[", "\x1b[200~", "[", "q", "[", "a", "]", "q", "]", "a", "\x1b[201~");
-	assert.equal(f.editor.getText(), "[q[a]q]a");
+	f.send("[", "\x1b[200~", "[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G", "\x1b[201~");
+	assert.equal(f.editor.getText(), "[q[a]q]aggG");
 	assert.equal(f.editor.mode, "normal");
 	assert.equal(f.editor.pendingKeys, "");
 	assert.deepEqual(f.jumpedRows, []);
@@ -292,14 +369,14 @@ test("focused overlays and autocomplete retain ownership of typing", (t) => {
 	f.at(0);
 	const input = new Input();
 	const overlay = f.tui.showOverlay(input);
-	f.send("[", "q", "]", "a");
-	assert.equal(input.getValue(), "[q]a");
+	f.send("[", "q", "]", "a", "g", "g", "G");
+	assert.equal(input.getValue(), "[q]aggG");
 	assert.deepEqual(f.jumpedRows, []);
 	overlay.hide();
 	f.editor.setText("");
 	f.editor.isShowingAutocomplete = () => true;
-	f.send("[", "q", "]", "a");
-	assert.equal(f.editor.getText(), "[q]a");
+	f.send("[", "q", "]", "a", "g", "g", "G");
+	assert.equal(f.editor.getText(), "[q]aggG");
 	assert.deepEqual(f.jumpedRows, []);
 });
 
@@ -308,7 +385,7 @@ test("regular mode and missing fullscreen layouts safely consume the bindings", 
 		const tui = { mode, terminal: new TestTerminal(), requestRender() {} };
 		const editor = new VimEditor(tui as unknown as TuiAltScreen, editorTheme, new KeybindingsManager({}) as EditorKeybindingsManager);
 		editor.setText("draft");
-		for (const key of ["[", "q", "[", "a", "]", "q", "]", "a"]) editor.handleInput(key);
+		for (const key of ["[", "q", "[", "a", "]", "q", "]", "a", "g", "g", "G"]) editor.handleInput(key);
 		assert.equal(editor.getText(), "draft");
 		assert.equal(editor.mode, "normal");
 		assert.equal(editor.pendingKeys, "");

@@ -1416,7 +1416,12 @@ export class VimEditor extends CustomEditor {
 			// g prefix (gg, ge, gE, g~, gu, gU, gJ)
 			if (this.pendingKeys === "g") {
 				this.pendingKeys = "";
-				if (data === "g") {
+				if (matchesKey(data, "g")) {
+					if (!this.operator && !this.countStr) {
+						this.transcriptNavigator.jumpToBoundary("start");
+						this.resetPending();
+						return;
+					}
 					const targetLine = this.countStr ? Number.parseInt(this.countStr, 10) - 1 : 0;
 					const pos = {
 						line: targetLine,
@@ -1468,6 +1473,13 @@ export class VimEditor extends CustomEditor {
 					this.resetPending();
 					return;
 				}
+			}
+
+			// Bare G navigates the conversation; counted and operator motions edit the draft.
+			if (matchesKey(data, "shift+g") && !this.operator && !this.countStr) {
+				this.transcriptNavigator.jumpToBoundary("end");
+				this.resetPending();
+				return;
 			}
 
 			// Conversation jump prefix (normal mode only, not an editor motion).
@@ -1809,7 +1821,7 @@ export class VimEditor extends CustomEditor {
 				this.tui.requestRender();
 				return;
 			}
-			if (data === "g") {
+			if (matchesKey(data, "g")) {
 				this.pendingKeys = "g";
 				this.tui.requestRender();
 				return;
@@ -2526,8 +2538,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(
 					"Vim Mode Reference:\n\n" +
 						"Modes: Normal (Esc), Insert (i, a, o, s, C), Visual (v, V, Ctrl+V), Replace (R)\n" +
-						"Motions: h/j/k/l, w/b/e/ge, 0/^/$, gg/G, f/F/t/T, %, {/}, H/M/L\n" +
-						"Conversation (Normal, fullscreen): [q/]q previous/next user question, [a/]a previous/next assistant answer\n" +
+						"Motions: h/j/k/l, w/b/e/ge, 0/^/$, Ngg/NG (draft line N), f/F/t/T, %, {/}, H/M/L\n" +
+						"Conversation (Normal, fullscreen): gg/G start/end, [q/]q previous/next user question, [a/]a previous/next assistant answer\n" +
 						"Text Objects: iw/aw, i\"/a\", i(/a(, i[/a[, i{/a{, i</a<, ip/ap\n" +
 						"Operators: d (delete), c (change), y (yank), > (indent), < (unindent)\n" +
 						"Editing: x/X, r, ~, J, p/P, u, Ctrl+R, . (repeat)\n" +

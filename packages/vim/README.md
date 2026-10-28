@@ -73,7 +73,8 @@ pi -e ~/dev/pi-agent-extensions/packages/vim
 | `e` / `E` | Next word / WORD end |
 | `ge` / `gE` | Previous word / WORD end |
 | `0` / `^` / `$` | Start of line / First non-blank / End of line |
-| `gg` / `G` | First line (or line `[N]gg`) / Last line (or line `[N]G`) |
+| `gg` / `G` | Conversation start / end (Normal mode, fullscreen) |
+| `Ngg` / `NG` | Draft line `N` (for example, `2gg` or `2G`) |
 | `f{c}` / `F{c}` | Find character `{c}` forward / backward on line |
 | `t{c}` / `T{c}` | Till character `{c}` forward / backward on line |
 | `;` / `,` | Repeat last find / Repeat in opposite direction |
@@ -85,19 +86,25 @@ pi -e ~/dev/pi-agent-extensions/packages/vim
 
 ### Conversation navigation
 
-In Pi's fullscreen view, press these key sequences in **Normal mode** to scroll to message starts:
+In Pi's fullscreen view, press these key sequences in **Normal mode** to scroll through the conversation:
 
 | Keys | Action |
 |---|---|
+| `gg` | Jump to the start of the conversation |
+| `G` | Jump to the end and follow new output |
 | `[q` | Jump to the previous user question |
 | `]q` | Jump to the next user question |
 | `[a` | Jump to the previous assistant answer |
 | `]a` | Jump to the next assistant answer |
 
-Jumps start from the top of the transcript viewport and skip tool calls and results.
-A count repeats the jump: `2[q` moves back two questions. Jumps stop at the first
-or last matching message without wrapping and leave your draft and editor cursor
-unchanged. `Esc` cancels a pending `[` or `]` prefix.
+Question and answer jumps start from the top of the transcript viewport and skip
+tool calls and results. A count repeats the jump: `2[q` moves back two questions.
+These jumps stop at the first or last matching message without wrapping.
+All conversation jumps leave your draft and editor cursor unchanged.
+
+Bare `gg` and `G` navigate the conversation. Counted forms such as `2gg` and `2G`
+still move to a draft line, and operator motions such as `dgg` and `dG` still edit
+the draft. `Esc` cancels a pending `g`, `[`, or `]` prefix.
 
 In Insert mode, these sequences are ordinary text. They don't navigate in Replace,
 Visual, Search, or Command modes, or while autocomplete or an overlay owns input.
