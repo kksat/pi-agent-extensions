@@ -29,16 +29,18 @@ SPDX-FileCopyrightText: 2026 Kirill Satarin (@kksat)
 
 import { execPath } from "node:process";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { basename, delimiter, join, sep } from "node:path";
+import { createServer, type Server } from "node:net";
 import { spawn } from "node-pty";
 import type { IPty } from "node-pty";
 import { Terminal } from "@xterm/headless";
 import type { IBufferCell } from "@xterm/headless";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import type { KeyId, TUI } from "@earendil-works/pi-tui";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { PassthroughScreen } from "./passthrough-screen.ts";
 
 // ---------------------------------------------------------------------------
@@ -108,6 +110,8 @@ export interface PassthroughSession {
 	sessionId: string;
 	sessionName: string;
 	detachResolver: (() => void) | null;
+	/** Input ops queued while this session has the screen; applied on detach. */
+	pendingInputOps: PromptPayload[];
 	/** Session-owned: keep parsing output even while no UI is attached. */
 	ptyDataDisposable?: { dispose(): void };
 	screen?: PassthroughScreen;
@@ -116,7 +120,20 @@ export interface PassthroughSession {
 interface GlobalTerminalState {
 	overlaySessions: Map<string, OverlaySession>;
 	passthroughSessions: Map<string, PassthroughSession>;
+	promptSockets: Map<string, PromptSocket>;
+	api: ExtensionAPI | null;
+	/** Most recent handler context; refreshed on every shortcut/command invocation. */
+	ctx: ExtensionContext | null;
+	/** Prompt-line dispatcher set by the current module; live socket servers call it. */
+	handlePromptLine: ((entry: TerminalEntry, line: string) => void) | null;
 	exitHookInstalled: boolean;
+}
+
+interface PromptSocket {
+	server: Server;
+	path: string;
+	/** Whether the data handler dispatches through globalState (survives /reload). */
+	dispatch: boolean;
 }
 
 declare global {
@@ -127,8 +144,251 @@ declare global {
 const globalState: GlobalTerminalState = (globalThis.__PI_TERMINAL_STATE__ ??= {
 	overlaySessions: new Map(),
 	passthroughSessions: new Map(),
+	promptSockets: new Map(),
+	api: null,
+	ctx: null,
+	handlePromptLine: null,
 	exitHookInstalled: false,
 });
+
+// ---------------------------------------------------------------------------
+// Prompt Channel (send prompts from the terminal's child back to pi)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ensure a Unix-socket prompt channel exists for a terminal entry and return
+ * its path. The path is exported to the child process as $PI_TERMINAL_SOCK so
+ * programs running inside the terminal (e.g. nvim) can submit prompts to pi.
+ * Servers created here dispatch through globalState.handlePromptLine, so a
+ * /reload that re-evaluates this module takes over live servers; servers
+ * without that indirection (from older module versions) are retired.
+ */
+function ensurePromptSocket(entry: TerminalEntry): string {
+	const existing = globalState.promptSockets.get(entry.id);
+	if (existing && existing.dispatch && existsSync(existing.path)) {
+		return existing.path;
+	}
+	if (existing) {
+		try {
+			existing.server.close();
+		} catch {}
+		try {
+			rmSync(existing.path, { force: true });
+		} catch {}
+		globalState.promptSockets.delete(entry.id);
+	}
+
+	const socketPath = join(
+		tmpdir(),
+		`pi-terminal-${process.pid}-${entry.id}-${randomUUID().slice(0, 8)}.sock`,
+	);
+
+	const server = createServer((conn) => {
+		conn.setEncoding("utf8");
+		let buffer = "";
+		conn.on("data", (chunk: string) => {
+			buffer += chunk;
+			let newlineIndex: number;
+			while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
+				const line = buffer.slice(0, newlineIndex).trim();
+				buffer = buffer.slice(newlineIndex + 1);
+				if (line) {
+					const dispatch =
+						globalState.handlePromptLine ??
+						((e: TerminalEntry, l: string) => handlePromptRequest(e, parsePromptLine(l)));
+					dispatch(entry, line);
+			}
+			}
+		});
+	});
+	server.on("error", () => {});
+
+	try {
+		server.listen(socketPath);
+	} catch {
+		return "";
+	}
+
+	globalState.promptSockets.set(entry.id, { server, path: socketPath, dispatch: true });
+	return socketPath;
+}
+
+/** A prompt submitted by a terminal child over the prompt socket. */
+interface PromptPayload {
+	text: string;
+	/**
+	 * - "submit": send a user message (detaches a passthrough editor first).
+	 * - "input": replace Pi's input editor text, then detach.
+	 * - "append": append one numbered item to Pi's input editor, no detach.
+	 * - "clear": empty Pi's input editor, no detach.
+	 * - "focus": detach a passthrough editor without touching the input.
+	 */
+	mode: "submit" | "input" | "append" | "clear" | "focus";
+	/** Header template for "append" mode; `{count}` is replaced with the item count. */
+	header?: string;
+}
+
+/**
+ * Decode one socket line into a prompt. Lines may be plain text or a JSON
+ * object `{ "text": "...", "mode": ..., "header": "..." }`, which is how
+ * multi-line prompts and input-mode requests are framed. Plain text lines
+ * submit as-is.
+ */
+function parsePromptLine(line: string): PromptPayload {
+	if (line.startsWith("{")) {
+		try {
+			const parsed: unknown = JSON.parse(line);
+			if (parsed && typeof parsed === "object") {
+				const obj = parsed as { text?: unknown; mode?: unknown; header?: unknown };
+				const mode =
+					obj.mode === "input" ||
+					obj.mode === "append" ||
+					obj.mode === "clear" ||
+					obj.mode === "focus"
+					? obj.mode
+					: "submit";
+				const text = typeof obj.text === "string" ? obj.text : "";
+				const header = typeof obj.header === "string" ? obj.header : undefined;
+				return { text, mode, header };
+			}
+		} catch {}
+	}
+	return { text: line, mode: "submit" };
+}
+
+/** Count lines that look like numbered items ("N. ..."). */
+function countNumberedItems(lines: string[]): number {
+	let count = 0;
+	for (const line of lines) {
+		if (/^\d+\.\s/.test(line)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+/**
+ * Append one numbered item to Pi's input editor text. The item number counts
+ * the numbered lines already present, so numbering stays correct across
+ * sends from Pi (which empty the input). When a header template is given and
+ * the input is empty, the header is written first (with `{count}` replaced);
+ * an unchanged header line has its count refreshed on later appends.
+ */
+function appendInputText(current: string, item: string, headerTemplate?: string): string {
+	const stripped = current.replace(/\s+$/, "");
+	const lines = stripped.length > 0 ? stripped.split("\n") : [];
+	const itemCount = countNumberedItems(lines);
+	const number = itemCount + 1;
+	const numberedItem = `${number}. ${item}`;
+
+	if (lines.length === 0) {
+		const header = headerTemplate?.replace("{count}", String(number));
+		return header ? `${header}\n${numberedItem}` : numberedItem;
+	}
+
+	let first = lines[0]!;
+	if (headerTemplate && first === headerTemplate.replace("{count}", String(itemCount))) {
+		first = headerTemplate.replace("{count}", String(number));
+	}
+	return [first, ...lines.slice(1), numberedItem].join("\n");
+}
+
+/**
+ * Handle one prompt from a terminal child according to its mode: submit it
+ * as a user message, place or append text in Pi's input editor for the user
+ * to edit and send, clear the input, or just detach back to Pi.
+ */
+/** Apply one input-box operation (append/clear) to Pi's editor. */
+function applyInputOp(ui: ExtensionUIContext, payload: PromptPayload): void {
+	if (payload.mode === "clear") {
+		ui.setEditorText("");
+	} else {
+		ui.setEditorText(appendInputText(ui.getEditorText(), payload.text, payload.header));
+	}
+}
+
+/** Pi's current extension UI context, when a UI is available. */
+function currentUi(): ExtensionUIContext | undefined {
+	const ctx = globalState.ctx;
+	return ctx?.hasUI ? ctx.ui : undefined;
+}
+
+/**
+ * Repaint Pi's UI. setEditorText alone does not request a render; routing a
+ * footer status update through setStatus does.
+ */
+function requestUiRender(): void {
+	updateFooterStatus(globalState.ctx);
+}
+
+/**
+ * Handle one prompt from a terminal child according to its mode: submit it
+ * as a user message, place or append text in Pi's input editor for the user
+ * to edit and send, clear the input, or just detach back to Pi.
+ */
+function handlePromptRequest(entry: TerminalEntry, payload: PromptPayload): void {
+	const passthrough = globalState.passthroughSessions.get(entry.id);
+	const detach = () => {
+		if (passthrough && !passthrough.paused && passthrough.detachResolver) {
+			passthrough.detachResolver();
+		}
+	};
+
+	if (payload.mode === "append" || payload.mode === "clear") {
+		// While a passthrough editor has the screen, Pi's input custom component
+		// restores the pre-attach editor text when it closes, so an input op
+		// applied now would be reverted on detach. Buffer it on the session and
+		// let the detach cleanup apply it after that restore.
+		if (passthrough && !passthrough.paused) {
+			passthrough.pendingInputOps.push(payload);
+			return;
+		}
+		const ui = currentUi();
+		if (ui) {
+			try {
+				applyInputOp(ui, payload);
+				requestUiRender();
+				return;
+			} catch {}
+		}
+		if (payload.mode === "clear") {
+			return;
+		}
+	} else if (payload.mode === "focus") {
+		detach();
+		return;
+	} else if (payload.mode === "input") {
+		detach();
+		const ui = currentUi();
+		if (ui) {
+			try {
+				ui.setEditorText(payload.text);
+				return;
+			} catch {}
+		}
+	}
+
+	// "submit" (and input-mode failures): detach and send to the model.
+	detach();
+	const api = globalState.api;
+	if (!api) {
+		return;
+	}
+	api.sendUserMessage(payload.text);
+}
+
+/** Close all prompt sockets and remove their socket files. */
+function closePromptSockets(): void {
+	for (const { server, path } of globalState.promptSockets.values()) {
+		try {
+			server.close();
+		} catch {}
+		try {
+			rmSync(path, { force: true });
+		} catch {}
+	}
+	globalState.promptSockets.clear();
+}
 
 // ---------------------------------------------------------------------------
 // Process Tree & Signal Hygiene
@@ -747,6 +1007,8 @@ function createOverlaySession(ctx: ExtensionContext, entry: TerminalEntry): Over
 			...process.env,
 			TERM: "xterm-256color",
 			COLORTERM: "truecolor",
+			PI_TERMINAL_SOCK: ensurePromptSocket(entry),
+			PI_TERMINAL_CWD: ctx.cwd,
 		},
 	});
 
@@ -992,6 +1254,8 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 					...process.env,
 					TERM: "xterm-256color",
 					COLORTERM: "truecolor",
+					PI_TERMINAL_SOCK: ensurePromptSocket(entry),
+					PI_TERMINAL_CWD: ctx.cwd,
 				},
 			});
 
@@ -1006,6 +1270,7 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 				sessionId: ctx.sessionManager?.getSessionId?.() ?? "",
 				sessionName: ctx.sessionManager?.getSessionName?.() || basename(ctx.cwd),
 				detachResolver: null,
+				pendingInputOps: [],
 			};
 			globalState.passthroughSessions.set(entry.id, session);
 
@@ -1083,6 +1348,23 @@ async function runPassthroughTerminal(ctx: ExtensionContext, entry: TerminalEntr
 
 			updateFooterStatus(ctx);
 			done(undefined);
+
+			// Apply input ops queued while this session had the screen. This runs
+			// after done(), because closing the passthrough custom component
+			// restores the editor text captured when it opened, which would wipe
+			// ops applied earlier.
+			const pendingOps = session!.pendingInputOps.splice(0);
+			if (pendingOps.length > 0) {
+				const ui = currentUi();
+				if (ui) {
+					for (const op of pendingOps) {
+						try {
+							applyInputOp(ui, op);
+						} catch {}
+					}
+					requestUiRender();
+				}
+			}
 		};
 
 		session!.detachResolver = cleanup;
@@ -1650,6 +1932,7 @@ async function handleTerminalCommandRoute(
 // ---------------------------------------------------------------------------
 
 async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
+	globalState.ctx = ctx;
 	if (ctx.mode !== "tui") {
 		ctx.ui.notify("Terminal requires interactive mode", "error");
 		return;
@@ -1679,6 +1962,23 @@ async function handler(ctx: ExtensionContext, entry: TerminalEntry) {
 }
 
 export default function (pi: ExtensionAPI) {
+	globalState.api = pi;
+	// Route prompt-socket traffic through this module's current code, so a
+	// /reload takes over live servers instead of leaving them on stale logic.
+	globalState.handlePromptLine = (entry, line) => handlePromptRequest(entry, parsePromptLine(line));
+	// Retire servers created before that indirection existed; the terminals
+	// using them must be restarted to pick up a fresh socket.
+	for (const [id, socket] of [...globalState.promptSockets]) {
+		if (!socket.dispatch) {
+			try {
+				socket.server.close();
+			} catch {}
+			try {
+				rmSync(socket.path, { force: true });
+			} catch {}
+			globalState.promptSockets.delete(id);
+		}
+	}
 	const currentEntries = loadEntries();
 	entries.length = 0;
 	entries.push(...currentEntries);
@@ -1719,6 +2019,7 @@ export default function (pi: ExtensionAPI) {
 			await killAllSessionsGraceful();
 			globalState.overlaySessions.clear();
 			globalState.passthroughSessions.clear();
+			closePromptSockets();
 			return;
 		}
 
