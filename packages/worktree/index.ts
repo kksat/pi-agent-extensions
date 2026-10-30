@@ -468,6 +468,58 @@ async function checkTmuxSessionExists(sessionName: string): Promise<boolean> {
 	return res.exitCode === 0;
 }
 
+/** Sessions created by spawnPiInTmux outside tmux; one worktree each. */
+function isDedicatedWorktreeSession(sessionName: string): boolean {
+	return sessionName.startsWith("pi-wt-");
+}
+
+/** Whether child is root itself or a path underneath it (sibling prefixes do not match). */
+function isPathInside(root: string, child: string): boolean {
+	if (!child) return false;
+	const relative = path.relative(root, canonicalPath(child));
+	return relative === "" ||
+		(!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+
+interface TmuxWindowPanes {
+	windowId: string;
+	sessionName: string;
+	windowName: string;
+	panePaths: string[];
+}
+
+/** Every tmux window with the working directories of its panes. */
+async function listTmuxWindows(): Promise<TmuxWindowPanes[]> {
+	const res = await exec("tmux", [
+		"list-panes", "-a", "-F", "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+	]);
+	if (res.exitCode !== 0) return [];
+
+	const windows = new Map<string, TmuxWindowPanes>();
+	for (const line of res.stdout.split("\n")) {
+		const [windowId, sessionName, windowName, panePath] = line.split("\t");
+		if (!/^@\d+$/.test(windowId)) continue;
+		const existing = windows.get(windowId);
+		if (existing) {
+			if (panePath) existing.panePaths.push(panePath);
+		} else {
+			windows.set(windowId, {
+				windowId,
+				sessionName,
+				windowName: windowName ?? "",
+				panePaths: panePath ? [panePath] : [],
+			});
+		}
+	}
+	return [...windows.values()];
+}
+
+/** A live window whose panes run inside this checkout, whatever it is named or recorded as. */
+function findWindowInWorktree(windows: TmuxWindowPanes[], worktreePath: string): TmuxWindowPanes | undefined {
+	const root = canonicalPath(worktreePath);
+	return windows.find((window) => window.panePaths.some((panePath) => isPathInside(root, panePath)));
+}
+
 /** Close worktree windows by ID; never kill the shared session that hosts them. */
 async function closeWorktreeTmuxWindows(worktreePath: string, record?: ManagedRecord): Promise<void> {
 	const panes = await exec("tmux", [
@@ -484,9 +536,7 @@ async function closeWorktreeTmuxWindows(worktreePath: string, record?: ManagedRe
 	for (const line of panes.stdout.split("\n")) {
 		const [windowId, sessionName, windowName, panePath] = line.split("\t");
 		if (!/^@\d+$/.test(windowId)) continue;
-		const relative = panePath ? path.relative(root, canonicalPath(panePath)) : undefined;
-		const inWorktree = relative !== undefined &&
-			(relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`)));
+		const inWorktree = isPathInside(root, panePath);
 		// Old creation fallbacks recorded the window name instead of its ID.
 		// Compare literal names here: `wt:topic` is not a valid tmux target expression.
 		const recordedWindow = record?.tmuxWindowId &&
@@ -623,6 +673,7 @@ async function switchToTmuxTarget(target: string): Promise<{ success: boolean; e
 async function getAllWorktreeStatuses(gitRoot: string): Promise<FullWorktreeStatus[]> {
 	const gitWorktrees = await getGitWorktrees(gitRoot);
 	const reg = await loadRegistry(gitRoot);
+	const paneWindows = await listTmuxWindows();
 
 	const statuses: FullWorktreeStatus[] = [];
 
@@ -635,27 +686,40 @@ async function getAllWorktreeStatuses(gitRoot: string): Promise<FullWorktreeStat
 		let tmuxActive = false;
 		let tmuxTarget: string | undefined;
 
-		if (record) {
-			if (record.tmuxWindowId && (await checkTmuxWindowExists(record.tmuxWindowId))) {
+		// Primary target: the window recorded at creation, even if its panes
+		// have since changed directory.
+		if (record?.tmuxWindowId && (await checkTmuxWindowExists(record.tmuxWindowId))) {
+			tmuxActive = true;
+			tmuxTarget = record.tmuxWindowId;
+		}
+
+		// Live discovery: any window whose panes run inside this checkout,
+		// whatever it is named or which tool created it. This catches renamed
+		// windows, windows started by other tools, and stale recorded window
+		// IDs. The primary checkout is skipped: its windows (including this
+		// one) always match its own path.
+		if (!tmuxActive && !isMain) {
+			const found = findWindowInWorktree(paneWindows, wt.path);
+			if (found) {
 				tmuxActive = true;
-				tmuxTarget = record.tmuxWindowId;
-			} else if (record.tmuxSession && (await checkTmuxSessionExists(record.tmuxSession))) {
-				tmuxActive = true;
-				tmuxTarget = record.tmuxSession;
+				// A dedicated session is switched to as a whole: its windows live in
+				// a different session than the caller's client.
+				tmuxTarget = isDedicatedWorktreeSession(found.sessionName) ? found.sessionName : found.windowId;
 			}
 		}
 
-		// Also check window by standard name pattern
+		// Dedicated detached sessions (worktrees created outside tmux). A
+		// recorded shared session is never a target: it is alive whenever its
+		// parent session is, and tmux resolves its bare name to the caller's own
+		// current window, making a switch there a silent no-op.
 		if (!tmuxActive && branch) {
-			const expectedWindowName = `wt:${sanitizeBranchForPath(branch)}`;
-			if (isInsideTmux() && (await checkTmuxWindowExists(expectedWindowName))) {
-				tmuxActive = true;
-				tmuxTarget = expectedWindowName;
-			} else {
-				const expectedSessionName = `pi-wt-${sanitizeBranchForPath(branch)}`;
-				if (await checkTmuxSessionExists(expectedSessionName)) {
+			const dedicatedSessions = [record?.tmuxSession, `pi-wt-${sanitizeBranchForPath(branch)}`]
+				.filter((name): name is string => Boolean(name && isDedicatedWorktreeSession(name)));
+			for (const sessionName of dedicatedSessions) {
+				if (await checkTmuxSessionExists(sessionName)) {
 					tmuxActive = true;
-					tmuxTarget = expectedSessionName;
+					tmuxTarget = sessionName;
+					break;
 				}
 			}
 		}

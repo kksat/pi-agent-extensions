@@ -9,6 +9,7 @@ Spin out new features, bugfixes, and experiments into isolated git worktrees run
 - **Promptless agent launch**: spawns `pi --name "wt:<branch>"` in tmux so the child agent is immediately ready for your interaction.
 - **Tmux native**: inside tmux, opens a new window in the active session; otherwise creates a detached session.
 - **Tracking & registry**: tracks worktrees created by the extension in the main checkout's `.pi/worktrees.json` (shared by every linked worktree). Each created worktree is also kept in `known`, which is not removed when the checkout is deleted.
+- **Live window discovery**: a worktree's tmux window is matched by the checkout its panes run in, so renamed windows, windows started by other tools, and stale recorded window IDs are still found. A shared parent session is never mistaken for the worktree's own window, and dedicated `pi-wt-*` sessions are switched to as a whole.
 - **Sessions across worktrees**: `/worktree sessions` opens a picker like `/resume`, starting with every recorded worktree, including checkouts that no longer exist. Tab switches to the current folder. Search matches the session text, branch, and worktree name (`branch:` and `worktree:` limit a token; Ctrl+Shift+B cycles the field). Sort and the named-session filter use the same keys as `/resume`. Choosing a session forks it into the current folder or another living directory when that folder is not already the session's directory. `git worktree list` is used only when nothing has been written down yet. Outside a git repository, the same command opens the usual session list.
 - **Easy cleanup**: `/worktree remove` and `/worktree clean` close the worktree’s tmux windows by ID, including renamed windows and windows discovered by checkout path outside tmux. Shared parent sessions and unrelated windows are preserved; dedicated worktree sessions disappear when their last window closes. Cleanup drops the active record and leaves the `known` path so its sessions stay reachable.
 - **Interactive worktree list**: `/worktree list` (also `/worktrees` or the menu's List action) opens a Vim-style browser with branch/path search, managed/tmux status, and shortcuts for every worktree command. Row actions operate on the highlighted worktree, not the invoking directory. All bindings are configurable in Pi's `keybindings.json`; RPC/non-terminal modes keep the textual list.
@@ -156,8 +157,9 @@ The extension prepares the selection and performs read-only Git/GitHub probes; P
 
 ```bash
 node --experimental-strip-types packages/worktree/test.ts
-# Requires tmux and the package’s Pi peer dependencies; uses an isolated tmux server:
+# Requires tmux and the package's Pi peer dependencies; uses an isolated tmux server:
 node --experimental-strip-types packages/worktree/remove.test.ts
+node --experimental-strip-types packages/worktree/switch.test.ts
 node --experimental-strip-types packages/worktree/rebase.test.ts
 node --experimental-strip-types packages/worktree/pr.test.ts
 # Requires the package's Pi peer dependencies to be installed:
