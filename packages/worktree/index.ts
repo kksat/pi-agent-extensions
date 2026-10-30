@@ -657,13 +657,51 @@ async function spawnPiInTmux(
 	return { success: false, isNewWindow: false, tmuxTarget: "", error: res.stderr };
 }
 
-async function switchToTmuxTarget(target: string): Promise<{ success: boolean; error?: string }> {
-	if (isInsideTmux()) {
-		const res = await exec("tmux", ["select-window", "-t", target]);
+interface ResolvedTmuxWindow {
+	windowId: string;
+	sessionName: string;
+}
+
+async function resolveTmuxWindow(target: string): Promise<ResolvedTmuxWindow | null> {
+	const res = await exec("tmux", ["display-message", "-p", "-t", target, "#{window_id}\t#{session_name}"]);
+	// display-message can succeed with empty output for a missing target.
+	const [windowId, sessionName] = res.exitCode === 0 ? res.stdout.split("\t") : [];
+	if (!/^@\d+$/.test(windowId ?? "") || !sessionName) return null;
+	return { windowId, sessionName };
+}
+
+async function windowRunsInWorktree(windowId: string, worktreePath: string): Promise<boolean> {
+	const res = await exec("tmux", ["list-panes", "-t", windowId, "-F", "#{pane_current_path}"]);
+	if (res.exitCode !== 0) return false;
+	const root = canonicalPath(worktreePath);
+	return res.stdout.split("\n").some((line) => isPathInside(root, line.trim()));
+}
+
+/**
+ * Move the caller to a worktree's tmux window. With worktreePath, the target
+ * must resolve to a live window running in that checkout: tmux resolves a
+ * bare session name as a window target to that session's current window —
+ * the window the caller is already looking at — so an unverified target can
+ * switch nowhere while reporting success. A window in another session is
+ * reached with switch-client, since select-window only changes that
+ * session's current window without moving the caller's client.
+ */
+async function switchToTmuxTarget(target: string, worktreePath?: string): Promise<{ success: boolean; error?: string }> {
+	if (!isInsideTmux()) return { success: true };
+	const resolved = await resolveTmuxWindow(target);
+	if (!resolved) return { success: false, error: `cannot resolve tmux window "${target}"` };
+	if (worktreePath && !(await windowRunsInWorktree(resolved.windowId, worktreePath))) {
+		return { success: false, error: `tmux window "${target}" is not running in ${worktreePath}` };
+	}
+	const currentSession = await getCurrentTmuxSession();
+	if (currentSession && resolved.sessionName !== currentSession) {
+		const res = await exec("tmux", ["switch-client", "-t", resolved.sessionName]);
 		if (res.exitCode === 0) return { success: true };
 		return { success: false, error: res.stderr };
 	}
-	return { success: true };
+	const res = await exec("tmux", ["select-window", "-t", resolved.windowId]);
+	if (res.exitCode === 0) return { success: true };
+	return { success: false, error: res.stderr };
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,14 +1597,14 @@ async function handleSwitchCommand(args: string, ctx: ExtensionCommandContext, g
 
 	if (isInsideTmux()) {
 		const windowTarget = target.tmuxTarget || `wt:${sanitizeBranchForPath(branch)}`;
-		const swRes = await switchToTmuxTarget(windowTarget);
+		const swRes = await switchToTmuxTarget(windowTarget, target.path);
 		if (swRes.success) {
 			ctx.ui.notify(`Switched to tmux window for "${branch}".`, "info");
 		} else {
-			// If window doesn't exist, spawn one
+			// If no verifiable window exists, spawn one
 			const spawnRes = await spawnPiInTmux(target.path, branch);
 			if (spawnRes.success && spawnRes.tmuxTarget) {
-				await switchToTmuxTarget(spawnRes.tmuxTarget);
+				await switchToTmuxTarget(spawnRes.tmuxTarget, target.path);
 				ctx.ui.notify(`Launched pi in tmux window and switched to "${branch}".`, "info");
 			} else {
 				ctx.ui.notify(`Failed to switch window: ${swRes.error || spawnRes.error}`, "error");

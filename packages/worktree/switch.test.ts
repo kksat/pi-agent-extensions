@@ -174,3 +174,41 @@ test("a dedicated session is found by record even when its window left the check
 	assert.equal(topic?.tmuxActive, true);
 	assert.equal(topic?.tmuxTarget, "pi-wt-topic");
 });
+
+test("switch selects the window running inside the worktree despite a stale record", async (t) => {
+	const f = fixture(t);
+	if (!f) return;
+	const agent = f.newWindow("agent");
+	f.register({ tmuxSession: "host", tmuxWindowId: "@999999" });
+	process.env.TMUX = "pi-worktree-switch-fixture"; // Pretend to run inside tmux.
+	const messages: string[] = [];
+	await f.runCommand("switch topic", messages);
+	assert.equal(f.activeWindow(), agent);
+	assert.ok(messages.some((message) => message.includes(`Switched to tmux window for "topic"`)));
+});
+
+test("switch spawns pi in the worktree when no window is live", async (t) => {
+	const f = fixture(t);
+	if (!f) return;
+	f.register({ tmuxSession: "host", tmuxWindowId: "@999999" });
+	process.env.TMUX = "pi-worktree-switch-fixture";
+	const messages: string[] = [];
+	await f.runCommand("switch topic", messages);
+	const lines = f.tmux("list-windows", "-a", "-F", "#{window_name}\t#{pane_current_path}").stdout.trim().split("\n");
+	assert.ok(lines.includes(`wt:topic\t${f.checkout}`), `spawned window must run in the worktree: ${lines.join(" | ")}`);
+	assert.ok(messages.some((message) => message.includes("Launched pi")));
+});
+
+test("switch refuses a live window that no longer runs in the worktree", async (t) => {
+	const f = fixture(t);
+	if (!f) return;
+	const keep = f.windowIdByName("keep");
+	assert.ok(keep);
+	f.register({ tmuxSession: "host", tmuxWindowId: keep });
+	process.env.TMUX = "pi-worktree-switch-fixture";
+	const messages: string[] = [];
+	await f.runCommand("switch topic", messages);
+	assert.notEqual(f.activeWindow(), keep, "must not silently switch to the unrelated window");
+	const lines = f.tmux("list-windows", "-a", "-F", "#{window_name}\t#{pane_current_path}").stdout.trim().split("\n");
+	assert.ok(lines.includes(`wt:topic\t${f.checkout}`), "a fresh worktree window must be spawned instead");
+});

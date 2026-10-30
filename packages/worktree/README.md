@@ -44,7 +44,7 @@ pi install npm:pi-extension-worktree
 | `/worktree clean` · `/worktree-clean` | Remove all managed worktrees & branches |
 | `/worktree remove [branch]` · `/worktree-remove` | Remove one worktree |
 | `/worktree rename <old> <new>` · `/worktree-rename` | Rename a branch |
-| `/worktree switch [branch]` | Switch / attach to its tmux window |
+| `/worktree switch [branch]` | Switch to its tmux window: resolved by recorded ID, live checkout path, or dedicated session, spawning pi when nothing verifies |
 | `/worktree rebase [branch]` | Rebase local `main`/`master` onto the current/selected topic worktree; Pi resolves conflicts in the main/master checkout |
 | `/worktree tip [branch]` | Rebase the current/selected topic worktree onto local `main`/`master`; Pi resolves conflicts in the topic checkout |
 | `/worktree pr [branch]` | Select a topic worktree (or name one), rebase onto remote `main`/`master`, create/reuse its PR with `/skill:pr`, and verify green CI |
