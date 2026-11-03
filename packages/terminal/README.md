@@ -111,7 +111,7 @@ From a shell inside a terminal:
 printf 'Review src/app.ts:42\n' | nc -U "$PI_TERMINAL_SOCK"
 ```
 
-From nvim (no `nc` needed, using nvim's built-in `sockconnect`), see a ready-made review keybind in [pi-review.lua](https://github.com/kksat/pi-agent-extensions). The core of it:
+From nvim, use the companion plugin [pi-review.nvim](https://github.com/kksat/pi-review-nvim) (local checkout: `~/dev/pi-review-nvim`). The core of it:
 
 ```lua
 local chan = vim.fn.sockconnect("pipe", os.getenv("PI_TERMINAL_SOCK"), { rpc = false })
@@ -119,7 +119,7 @@ vim.fn.chansend(chan, "Review " .. vim.fn.expand("%:p") .. ":" .. vim.fn.line(".
 vim.fn.chanclose(chan)
 ```
 
-While nvim runs in passthrough mode, the review keybinds work like this: an immediate keybind submits a comment straight to the model; an "add" keybind appends each comment to Pi's input box as you go (you stay in nvim), and a "send" keybind detaches back to Pi, where the accumulated comments sit in the input box ready to edit and send with Enter. Alternatively, `add_mode = "queue"` in `vim.g.pi_review` accumulates comments inside nvim and flushes them in one batch. The per-item prompt format is configurable via `vim.g.pi_review` — separate templates for cursor items and visual selections, toggles for the symbol, line text, or column, and placeholders including `{file}` (absolute), `{relative_file_path}` (relative to Pi's working directory), `{line1}`/`{line2}`, `{col}`, `{symbol}`, `{line_text}`, `{comment}` — see the header of `pi-review.lua` for the full option list. Socket files live in `$TMPDIR` and are removed when Pi exits.
+While nvim runs in passthrough mode, the review keybinds work like this: an immediate keybind submits a comment straight to the model; an "add" keybind appends each comment to Pi's input box as you go (you stay in nvim), and a "send" keybind detaches back to Pi, where the accumulated comments sit in the input box ready to edit and send with Enter. Alternatively, `add_mode = "queue"` in `vim.g.pi_review` accumulates comments inside nvim and flushes them in one batch. The per-item prompt format is configurable via `vim.g.pi_review` — separate templates for cursor items and visual selections, toggles for the symbol, line text, or column, and placeholders including `{file}` (absolute), `{relative_file_path}` (relative to Pi's working directory), `{line1}`/`{line2}`, `{col}`, `{symbol}`, `{line_text}`, `{comment}` — see the pi-review.nvim README for the full option list. Socket files live in `$TMPDIR` and are removed when Pi exits.
 
 #### CLI Subcommands:
 
