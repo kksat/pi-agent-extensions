@@ -7,6 +7,7 @@ A collection of custom [pi](https://pi.dev) packages, each installable separatel
 | Package | Description |
 |---|---|
 | [`packages/worktree`](./packages/worktree) | Manage git worktrees with tmux-integrated pi agents |
+| [`packages/worktree-rex`](./packages/worktree-rex) | The same worktree workflow with Rex tabs instead of tmux |
 | [`packages/terminal`](./packages/terminal) | Embedded PTY terminal pane toggled with Ctrl+/ |
 | [`packages/vim`](./packages/vim) | Full-featured Vim modal editing for the prompt editor |
 | [`packages/calm`](./packages/calm) | Calm mode: conversation-only transcript presentation with an animated working boat |
@@ -27,6 +28,10 @@ pi install ~/dev/pi-agent-extensions/packages/calm
 pi install ~/dev/pi-agent-extensions/packages/cmux-notify
 pi install ~/dev/pi-agent-extensions/packages/tmux-attention
 ```
+
+To use Rex instead of tmux, install `packages/worktree-rex` in place of
+`packages/worktree`. Don't enable both: they register the same commands and
+tools. See the [worktree-rex installation guide](./packages/worktree-rex/README.md#install).
 
 Local path installs are not copied — edits to the files take effect on the next pi start (or `/reload`).
 

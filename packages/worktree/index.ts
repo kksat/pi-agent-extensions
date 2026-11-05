@@ -59,1642 +59,1704 @@ import { WorktreePrWorkflow } from "./pr.ts";
 import { WorktreeSessionSelector, renameSessionFile } from "./session-picker.ts";
 import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.ts";
 
-const WORKTREE_REGISTRY_FILE = "worktrees.json";
-const WORKTREE_ENTRY_TYPE = "worktree-entry";
+import type { TerminalTarget, WorktreeTerminal } from "./terminal.ts";
 
-interface ManagedRecord {
-	branch: string;
-	path: string;
-	baseBranch?: string;
-	createdAt: number;
-	tmuxSession?: string;
-	tmuxWindowId?: string;
-	tmuxWindowIndex?: number;
-}
+/** Registers the worktree workflow; alternative packages supply their terminal transport. */
+export default function registerWorktree(pi: ExtensionAPI, terminal?: WorktreeTerminal) {
+const WORKTREE_REGISTRY_FILE = terminal?.registryFile ?? "worktrees.json";
+	const WORKTREE_ENTRY_TYPE = "worktree-entry";
 
-/** A worktree path recorded at creation. Kept after the checkout is removed. */
-interface KnownWorktree {
-	branch: string;
-	path: string;
-	baseBranch?: string;
-	createdAt: number;
-}
-
-interface RegistryData {
-	version: 1;
-	/** Worktrees the extension currently manages. Removed on /worktree remove and clean. */
-	worktrees: Record<string, ManagedRecord>;
-	/** Every worktree this extension has created. Never deleted, so its sessions stay reachable. */
-	known: KnownWorktree[];
-}
-
-interface GitWorktreeInfo {
-	path: string;
-	branch?: string;
-	commit?: string;
-	bare?: boolean;
-	locked?: boolean;
-	prunable?: boolean;
-}
-
-interface FullWorktreeStatus extends GitWorktreeInfo {
-	isMain: boolean;
-	isManaged: boolean;
-	managedRecord?: ManagedRecord;
-	tmuxActive: boolean;
-	tmuxTarget?: string;
-}
-
-// ---------------------------------------------------------------------------
-// Shell & Git Helpers
-// ---------------------------------------------------------------------------
-
-async function exec(
-	cmd: string,
-	args: string[],
-	cwd?: string,
-	signal?: AbortSignal,
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-	return new Promise((resolve) => {
-		const proc = spawn(cmd, args, {
-			cwd,
-			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-
-		let stdout = "";
-		let stderr = "";
-
-		proc.stdout.on("data", (d) => {
-			stdout += d.toString();
-		});
-		proc.stderr.on("data", (d) => {
-			stderr += d.toString();
-		});
-
-		proc.on("close", (code) => {
-			resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode: code ?? 0 });
-		});
-
-		proc.on("error", (err) => {
-			resolve({ stdout: "", stderr: err.message, exitCode: 1 });
-		});
-
-		if (signal) {
-			signal.addEventListener(
-				"abort",
-				() => {
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 3000);
-				},
-				{ once: true },
-			);
-		}
-	});
-}
-
-/**
- * Main worktree root for this repository.
- * Linked worktrees report their own toplevel; the registry has to live on the
- * main checkout so it is still readable after one of those checkouts is removed.
- */
-async function getGitRoot(cwd: string): Promise<string | null> {
-	const main = await resolveMainGitRoot(cwd);
-	if (!main) return null;
-	await mergeLinkedCheckoutRegistry(cwd, main);
-	return main;
-}
-
-async function resolveMainGitRoot(cwd: string): Promise<string | null> {
-	const absolute = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
-	let commonRaw = absolute.exitCode === 0 ? absolute.stdout : "";
-	if (!commonRaw) {
-		const relative = await exec("git", ["rev-parse", "--git-common-dir"], cwd);
-		if (relative.exitCode === 0) commonRaw = relative.stdout;
+	interface ManagedRecord {
+		branch: string;
+		path: string;
+		baseBranch?: string;
+		createdAt: number;
+		tmuxSession?: string;
+		tmuxWindowId?: string;
+		tmuxWindowIndex?: number;
+		terminal?: TerminalTarget;
 	}
-	if (commonRaw) {
-		const commonDir = path.resolve(cwd, commonRaw);
-		if (path.basename(commonDir) === ".git") return path.dirname(commonDir);
+
+	/** A worktree path recorded at creation. Kept after the checkout is removed. */
+	interface KnownWorktree {
+		branch: string;
+		path: string;
+		baseBranch?: string;
+		createdAt: number;
 	}
-	const top = await exec("git", ["rev-parse", "--show-toplevel"], cwd);
-	return top.exitCode === 0 && top.stdout ? top.stdout : null;
-}
 
-async function getGitWorktrees(gitRoot: string): Promise<GitWorktreeInfo[]> {
-	const res = await exec("git", ["worktree", "list", "--porcelain"], gitRoot);
-	if (res.exitCode !== 0) return [];
+	interface RegistryData {
+		version: 1;
+		/** Worktrees the extension currently manages. Removed on /worktree remove and clean. */
+		worktrees: Record<string, ManagedRecord>;
+		/** Every worktree this extension has created. Never deleted, so its sessions stay reachable. */
+		known: KnownWorktree[];
+	}
 
-	const list: GitWorktreeInfo[] = [];
-	let current: Partial<GitWorktreeInfo> = {};
+	interface GitWorktreeInfo {
+		path: string;
+		branch?: string;
+		commit?: string;
+		bare?: boolean;
+		locked?: boolean;
+		prunable?: boolean;
+	}
 
-	for (const line of res.stdout.split("\n")) {
-		const trimmed = line.trim();
-		if (trimmed.startsWith("worktree ")) {
-			if (current.path) {
-				list.push(current as GitWorktreeInfo);
+	interface FullWorktreeStatus extends GitWorktreeInfo {
+		isMain: boolean;
+		isManaged: boolean;
+		managedRecord?: ManagedRecord;
+		tmuxActive: boolean;
+		tmuxTarget?: string;
+		terminalActive?: boolean;
+		terminalLabel?: string;
+		terminalTarget?: TerminalTarget;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Shell & Git Helpers
+	// ---------------------------------------------------------------------------
+
+	async function exec(
+		cmd: string,
+		args: string[],
+		cwd?: string,
+		signal?: AbortSignal,
+	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+		return new Promise((resolve) => {
+			const proc = spawn(cmd, args, {
+				cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+
+			let stdout = "";
+			let stderr = "";
+
+			proc.stdout.on("data", (d) => {
+				stdout += d.toString();
+			});
+			proc.stderr.on("data", (d) => {
+				stderr += d.toString();
+			});
+
+			proc.on("close", (code) => {
+				resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode: code ?? 0 });
+			});
+
+			proc.on("error", (err) => {
+				resolve({ stdout: "", stderr: err.message, exitCode: 1 });
+			});
+
+			if (signal) {
+				signal.addEventListener(
+					"abort",
+					() => {
+						proc.kill("SIGTERM");
+						setTimeout(() => {
+							if (!proc.killed) proc.kill("SIGKILL");
+						}, 3000);
+					},
+					{ once: true },
+				);
 			}
-			current = { path: trimmed.slice(9) };
-		} else if (trimmed.startsWith("HEAD ")) {
-			current.commit = trimmed.slice(5);
-		} else if (trimmed.startsWith("branch ")) {
-			current.branch = trimmed.slice(7).replace(/^refs\/heads\//, "");
-		} else if (trimmed === "bare") {
-			current.bare = true;
-		} else if (trimmed.startsWith("locked")) {
-			current.locked = true;
-		} else if (trimmed.startsWith("prunable")) {
-			current.prunable = true;
-		} else if (trimmed === "") {
-			if (current.path) {
-				list.push(current as GitWorktreeInfo);
-				current = {};
+		});
+	}
+
+	/**
+	 * Main worktree root for this repository.
+	 * Linked worktrees report their own toplevel; the registry has to live on the
+	 * main checkout so it is still readable after one of those checkouts is removed.
+	 */
+	async function getGitRoot(cwd: string): Promise<string | null> {
+		const main = await resolveMainGitRoot(cwd);
+		if (!main) return null;
+		await mergeLinkedCheckoutRegistry(cwd, main);
+		return main;
+	}
+
+	async function resolveMainGitRoot(cwd: string): Promise<string | null> {
+		const absolute = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
+		let commonRaw = absolute.exitCode === 0 ? absolute.stdout : "";
+		if (!commonRaw) {
+			const relative = await exec("git", ["rev-parse", "--git-common-dir"], cwd);
+			if (relative.exitCode === 0) commonRaw = relative.stdout;
+		}
+		if (commonRaw) {
+			const commonDir = path.resolve(cwd, commonRaw);
+			if (path.basename(commonDir) === ".git") return path.dirname(commonDir);
+		}
+		const top = await exec("git", ["rev-parse", "--show-toplevel"], cwd);
+		return top.exitCode === 0 && top.stdout ? top.stdout : null;
+	}
+
+	async function getGitWorktrees(gitRoot: string): Promise<GitWorktreeInfo[]> {
+		const res = await exec("git", ["worktree", "list", "--porcelain"], gitRoot);
+		if (res.exitCode !== 0) return [];
+
+		const list: GitWorktreeInfo[] = [];
+		let current: Partial<GitWorktreeInfo> = {};
+
+		for (const line of res.stdout.split("\n")) {
+			const trimmed = line.trim();
+			if (trimmed.startsWith("worktree ")) {
+				if (current.path) {
+					list.push(current as GitWorktreeInfo);
+				}
+				current = { path: trimmed.slice(9) };
+			} else if (trimmed.startsWith("HEAD ")) {
+				current.commit = trimmed.slice(5);
+			} else if (trimmed.startsWith("branch ")) {
+				current.branch = trimmed.slice(7).replace(/^refs\/heads\//, "");
+			} else if (trimmed === "bare") {
+				current.bare = true;
+			} else if (trimmed.startsWith("locked")) {
+				current.locked = true;
+			} else if (trimmed.startsWith("prunable")) {
+				current.prunable = true;
+			} else if (trimmed === "") {
+				if (current.path) {
+					list.push(current as GitWorktreeInfo);
+					current = {};
+				}
 			}
 		}
+		if (current.path) {
+			list.push(current as GitWorktreeInfo);
+		}
+		return list;
 	}
-	if (current.path) {
-		list.push(current as GitWorktreeInfo);
+
+	async function checkBranchExists(gitRoot: string, branch: string): Promise<boolean> {
+		const res = await exec("git", ["rev-parse", "--verify", `refs/heads/${branch}`], gitRoot);
+		return res.exitCode === 0;
 	}
-	return list;
-}
 
-async function checkBranchExists(gitRoot: string, branch: string): Promise<boolean> {
-	const res = await exec("git", ["rev-parse", "--verify", `refs/heads/${branch}`], gitRoot);
-	return res.exitCode === 0;
-}
-
-async function getCurrentBranch(gitRoot: string): Promise<string> {
-	const res = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], gitRoot);
-	return res.exitCode === 0 ? res.stdout : "main";
-}
-
-function sanitizeBranchForPath(branch: string): string {
-	return branch.replace(/[\/\\:*?"<>|]/g, "-").replace(/^-+|-+$/g, "");
-}
-
-function computeWorktreePath(gitRoot: string, branch: string): string {
-	const repoName = path.basename(gitRoot);
-	const parentDir = path.dirname(gitRoot);
-	const sanitized = sanitizeBranchForPath(branch);
-	return path.join(parentDir, `${repoName}-${sanitized}`);
-}
-
-// ---------------------------------------------------------------------------
-// Registry / Persistence
-// ---------------------------------------------------------------------------
-
-function getRegistryFilePath(gitRoot: string): string {
-	const piDir = path.join(gitRoot, ".pi");
-	return path.join(piDir, WORKTREE_REGISTRY_FILE);
-}
-
-function recordToKnown(record: ManagedRecord): KnownWorktree {
-	return {
-		branch: record.branch,
-		path: record.path,
-		baseBranch: record.baseBranch,
-		createdAt: record.createdAt,
-	};
-}
-
-function isKnownWorktree(value: unknown): value is KnownWorktree {
-	if (!value || typeof value !== "object") return false;
-	const record = value as Partial<KnownWorktree>;
-	return typeof record.branch === "string" && typeof record.path === "string" && typeof record.createdAt === "number";
-}
-
-function canonicalPath(dir: string): string {
-	try {
-		return fs.realpathSync(dir);
-	} catch {
-		return path.resolve(dir);
+	async function getCurrentBranch(gitRoot: string): Promise<string> {
+		const res = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], gitRoot);
+		return res.exitCode === 0 ? res.stdout : "main";
 	}
-}
 
-function sameDirectory(a: string, b: string): boolean {
-	if (!a || !b) return false;
-	try {
-		return canonicalPath(a) === canonicalPath(b);
-	} catch {
-		return false;
+	function sanitizeBranchForPath(branch: string): string {
+		return branch.replace(/[\/\\:*?"<>|]/g, "-").replace(/^-+|-+$/g, "");
 	}
-}
 
-function resolveUserPath(input: string, base: string): string {
-	const trimmed = input.trim();
-	if (trimmed === "~") return os.homedir();
-	if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
-	return path.resolve(base, trimmed);
-}
-
-function directoryExists(dir: string): boolean {
-	try {
-		return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
-	} catch {
-		return false;
+	function computeWorktreePath(gitRoot: string, branch: string): string {
+		const repoName = path.basename(gitRoot);
+		const parentDir = path.dirname(gitRoot);
+		const sanitized = sanitizeBranchForPath(branch);
+		return path.join(parentDir, `${repoName}-${sanitized}`);
 	}
-}
 
-function upsertKnownWorktree(reg: RegistryData, record: ManagedRecord): boolean {
-	const existing = reg.known.find((known) => sameDirectory(known.path, record.path));
-	if (existing) {
+	// ---------------------------------------------------------------------------
+	// Registry / Persistence
+	// ---------------------------------------------------------------------------
+
+	function getRegistryFilePath(gitRoot: string): string {
+		const piDir = path.join(gitRoot, ".pi");
+		return path.join(piDir, WORKTREE_REGISTRY_FILE);
+	}
+
+	function recordToKnown(record: ManagedRecord): KnownWorktree {
+		return {
+			branch: record.branch,
+			path: record.path,
+			baseBranch: record.baseBranch,
+			createdAt: record.createdAt,
+		};
+	}
+
+	function isKnownWorktree(value: unknown): value is KnownWorktree {
+		if (!value || typeof value !== "object") return false;
+		const record = value as Partial<KnownWorktree>;
+		return typeof record.branch === "string" && typeof record.path === "string" && typeof record.createdAt === "number";
+	}
+
+	function canonicalPath(dir: string): string {
+		try {
+			return fs.realpathSync(dir);
+		} catch {
+			return path.resolve(dir);
+		}
+	}
+
+	function sameDirectory(a: string, b: string): boolean {
+		if (!a || !b) return false;
+		try {
+			return canonicalPath(a) === canonicalPath(b);
+		} catch {
+			return false;
+		}
+	}
+
+	function resolveUserPath(input: string, base: string): string {
+		const trimmed = input.trim();
+		if (trimmed === "~") return os.homedir();
+		if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
+		return path.resolve(base, trimmed);
+	}
+
+	function directoryExists(dir: string): boolean {
+		try {
+			return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+		} catch {
+			return false;
+		}
+	}
+
+	function upsertKnownWorktree(reg: RegistryData, record: ManagedRecord): boolean {
+		const existing = reg.known.find((known) => sameDirectory(known.path, record.path));
+		if (existing) {
+			let changed = false;
+			if (existing.branch !== record.branch) {
+				existing.branch = record.branch;
+				changed = true;
+			}
+			if (record.baseBranch && existing.baseBranch !== record.baseBranch) {
+				existing.baseBranch = record.baseBranch;
+				changed = true;
+			}
+			return changed;
+		}
+		reg.known.push(recordToKnown(record));
+		return true;
+	}
+
+	async function loadRegistry(gitRoot: string): Promise<RegistryData> {
+		const filePath = getRegistryFilePath(gitRoot);
+		try {
+			const raw = await fs.promises.readFile(filePath, "utf-8");
+			const data = JSON.parse(raw) as Partial<RegistryData> | null;
+			if (data && data.version === 1 && data.worktrees && typeof data.worktrees === "object") {
+				const hadKnown = Array.isArray(data.known);
+				const known = hadKnown
+					? data.known!.filter(isKnownWorktree)
+					: Object.values(data.worktrees).map(recordToKnown);
+				const reg: RegistryData = { version: 1, worktrees: data.worktrees, known };
+				// Older registries only stored active worktrees. Keep those paths for sessions.
+				if (!hadKnown) {
+					await saveRegistry(gitRoot, reg);
+				}
+				return reg;
+			}
+		} catch {
+			// File does not exist or invalid
+		}
+		return { version: 1, worktrees: {}, known: [] };
+	}
+
+	function asManagedRecord(value: unknown): ManagedRecord | null {
+		if (!value || typeof value !== "object") return null;
+		const record = value as Partial<ManagedRecord>;
+		if (typeof record.branch !== "string" || typeof record.path !== "string") return null;
+		return {
+			branch: record.branch,
+			path: record.path,
+			baseBranch: typeof record.baseBranch === "string" ? record.baseBranch : undefined,
+			createdAt: typeof record.createdAt === "number" ? record.createdAt : Date.now(),
+			tmuxSession: typeof record.tmuxSession === "string" ? record.tmuxSession : undefined,
+			tmuxWindowId: typeof record.tmuxWindowId === "string" ? record.tmuxWindowId : undefined,
+			tmuxWindowIndex: typeof record.tmuxWindowIndex === "number" ? record.tmuxWindowIndex : undefined,
+			terminal: record.terminal,
+		};
+	}
+
+	/**
+	 * Older builds stored `.pi/worktrees.json` in whichever checkout ran the command.
+	 * Copy that into the main checkout once so removed linked worktrees stay listed.
+	 */
+	async function mergeLinkedCheckoutRegistry(cwd: string, mainRoot: string): Promise<void> {
+		const top = await exec("git", ["rev-parse", "--show-toplevel"], cwd);
+		if (top.exitCode !== 0 || !top.stdout) return;
+		if (sameDirectory(top.stdout, mainRoot)) return;
+
+		let parsed: Partial<RegistryData> | null = null;
+		try {
+			const raw = await fs.promises.readFile(getRegistryFilePath(top.stdout), "utf-8");
+			parsed = JSON.parse(raw) as Partial<RegistryData>;
+		} catch {
+			return;
+		}
+		if (!parsed || parsed.version !== 1 || !parsed.worktrees || typeof parsed.worktrees !== "object") return;
+
+		const incomingActive = Object.values(parsed.worktrees)
+			.map(asManagedRecord)
+			.filter((record): record is ManagedRecord => record !== null);
+		const incomingKnown = Array.isArray(parsed.known)
+			? parsed.known.map(asManagedRecord).filter((record): record is ManagedRecord => record !== null)
+			: incomingActive;
+		if (incomingActive.length === 0 && incomingKnown.length === 0) return;
+
+		const reg = await loadRegistry(mainRoot);
 		let changed = false;
-		if (existing.branch !== record.branch) {
-			existing.branch = record.branch;
-			changed = true;
-		}
-		if (record.baseBranch && existing.baseBranch !== record.baseBranch) {
-			existing.baseBranch = record.baseBranch;
-			changed = true;
-		}
-		return changed;
-	}
-	reg.known.push(recordToKnown(record));
-	return true;
-}
-
-async function loadRegistry(gitRoot: string): Promise<RegistryData> {
-	const filePath = getRegistryFilePath(gitRoot);
-	try {
-		const raw = await fs.promises.readFile(filePath, "utf-8");
-		const data = JSON.parse(raw) as Partial<RegistryData> | null;
-		if (data && data.version === 1 && data.worktrees && typeof data.worktrees === "object") {
-			const hadKnown = Array.isArray(data.known);
-			const known = hadKnown
-				? data.known!.filter(isKnownWorktree)
-				: Object.values(data.worktrees).map(recordToKnown);
-			const reg: RegistryData = { version: 1, worktrees: data.worktrees, known };
-			// Older registries only stored active worktrees. Keep those paths for sessions.
-			if (!hadKnown) {
-				await saveRegistry(gitRoot, reg);
+		for (const record of incomingActive) {
+			if (!reg.worktrees[record.branch]) {
+				reg.worktrees[record.branch] = record;
+				changed = true;
 			}
-			return reg;
+			if (upsertKnownWorktree(reg, record)) changed = true;
 		}
-	} catch {
-		// File does not exist or invalid
-	}
-	return { version: 1, worktrees: {}, known: [] };
-}
-
-function asManagedRecord(value: unknown): ManagedRecord | null {
-	if (!value || typeof value !== "object") return null;
-	const record = value as Partial<ManagedRecord>;
-	if (typeof record.branch !== "string" || typeof record.path !== "string") return null;
-	return {
-		branch: record.branch,
-		path: record.path,
-		baseBranch: typeof record.baseBranch === "string" ? record.baseBranch : undefined,
-		createdAt: typeof record.createdAt === "number" ? record.createdAt : Date.now(),
-		tmuxSession: typeof record.tmuxSession === "string" ? record.tmuxSession : undefined,
-		tmuxWindowId: typeof record.tmuxWindowId === "string" ? record.tmuxWindowId : undefined,
-		tmuxWindowIndex: typeof record.tmuxWindowIndex === "number" ? record.tmuxWindowIndex : undefined,
-	};
-}
-
-/**
- * Older builds stored `.pi/worktrees.json` in whichever checkout ran the command.
- * Copy that into the main checkout once so removed linked worktrees stay listed.
- */
-async function mergeLinkedCheckoutRegistry(cwd: string, mainRoot: string): Promise<void> {
-	const top = await exec("git", ["rev-parse", "--show-toplevel"], cwd);
-	if (top.exitCode !== 0 || !top.stdout) return;
-	if (sameDirectory(top.stdout, mainRoot)) return;
-
-	let parsed: Partial<RegistryData> | null = null;
-	try {
-		const raw = await fs.promises.readFile(getRegistryFilePath(top.stdout), "utf-8");
-		parsed = JSON.parse(raw) as Partial<RegistryData>;
-	} catch {
-		return;
-	}
-	if (!parsed || parsed.version !== 1 || !parsed.worktrees || typeof parsed.worktrees !== "object") return;
-
-	const incomingActive = Object.values(parsed.worktrees)
-		.map(asManagedRecord)
-		.filter((record): record is ManagedRecord => record !== null);
-	const incomingKnown = Array.isArray(parsed.known)
-		? parsed.known.map(asManagedRecord).filter((record): record is ManagedRecord => record !== null)
-		: incomingActive;
-	if (incomingActive.length === 0 && incomingKnown.length === 0) return;
-
-	const reg = await loadRegistry(mainRoot);
-	let changed = false;
-	for (const record of incomingActive) {
-		if (!reg.worktrees[record.branch]) {
-			reg.worktrees[record.branch] = record;
-			changed = true;
+		for (const record of incomingKnown) {
+			if (upsertKnownWorktree(reg, record)) changed = true;
 		}
-		if (upsertKnownWorktree(reg, record)) changed = true;
+		if (changed) await saveRegistry(mainRoot, reg);
 	}
-	for (const record of incomingKnown) {
-		if (upsertKnownWorktree(reg, record)) changed = true;
-	}
-	if (changed) await saveRegistry(mainRoot, reg);
-}
 
-async function saveRegistry(gitRoot: string, data: RegistryData): Promise<void> {
-	const filePath = getRegistryFilePath(gitRoot);
-	const dir = path.dirname(filePath);
-	try {
-		await fs.promises.mkdir(dir, { recursive: true });
-		await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
-	} catch {
-		// Ignore write error
-	}
-}
-
-async function registerManagedWorktree(gitRoot: string, record: ManagedRecord): Promise<void> {
-	const reg = await loadRegistry(gitRoot);
-	reg.worktrees[record.branch] = record;
-	upsertKnownWorktree(reg, record);
-	await saveRegistry(gitRoot, reg);
-}
-
-async function unregisterManagedWorktree(gitRoot: string, branch: string): Promise<void> {
-	const reg = await loadRegistry(gitRoot);
-	delete reg.worktrees[branch];
-	await saveRegistry(gitRoot, reg);
-}
-
-async function renameManagedWorktreeRecord(gitRoot: string, oldBranch: string, newBranch: string): Promise<void> {
-	const reg = await loadRegistry(gitRoot);
-	const rec = reg.worktrees[oldBranch];
-	if (rec) {
-		rec.branch = newBranch;
-		delete reg.worktrees[oldBranch];
-		reg.worktrees[newBranch] = rec;
-	}
-	let changed = Boolean(rec);
-	for (const known of reg.known) {
-		const matchesRecord = rec ? sameDirectory(known.path, rec.path) : false;
-		if (matchesRecord || (!rec && known.branch === oldBranch)) {
-			known.branch = newBranch;
-			changed = true;
+	async function saveRegistry(gitRoot: string, data: RegistryData): Promise<void> {
+		const filePath = getRegistryFilePath(gitRoot);
+		const dir = path.dirname(filePath);
+		try {
+			await fs.promises.mkdir(dir, { recursive: true });
+			await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
+		} catch {
+			// Ignore write error
 		}
 	}
-	if (changed) {
+
+	async function registerManagedWorktree(gitRoot: string, record: ManagedRecord): Promise<void> {
+		const reg = await loadRegistry(gitRoot);
+		reg.worktrees[record.branch] = record;
+		upsertKnownWorktree(reg, record);
 		await saveRegistry(gitRoot, reg);
 	}
-}
 
-// ---------------------------------------------------------------------------
-// Tmux Helpers
-// ---------------------------------------------------------------------------
+	async function unregisterManagedWorktree(gitRoot: string, branch: string): Promise<void> {
+		const reg = await loadRegistry(gitRoot);
+		delete reg.worktrees[branch];
+		await saveRegistry(gitRoot, reg);
+	}
 
-async function isTmuxAvailable(): Promise<boolean> {
-	const res = await exec("tmux", ["-V"]);
-	return res.exitCode === 0;
-}
-
-function isInsideTmux(): boolean {
-	return Boolean(process.env.TMUX);
-}
-
-async function getCurrentTmuxSession(): Promise<string | null> {
-	if (!isInsideTmux()) return null;
-	const res = await exec("tmux", ["display-message", "-p", "#{session_name}"]);
-	return res.exitCode === 0 && res.stdout ? res.stdout : null;
-}
-
-async function checkTmuxWindowExists(target: string): Promise<boolean> {
-	const res = await exec("tmux", ["display-message", "-p", "-t", target, "#{window_id}"]);
-	// display-message can succeed with empty output for a missing target.
-	return res.exitCode === 0 && /^@\d+$/.test(res.stdout);
-}
-
-async function checkTmuxSessionExists(sessionName: string): Promise<boolean> {
-	const res = await exec("tmux", ["has-session", "-t", sessionName]);
-	return res.exitCode === 0;
-}
-
-/** Sessions created by spawnPiInTmux outside tmux; one worktree each. */
-function isDedicatedWorktreeSession(sessionName: string): boolean {
-	return sessionName.startsWith("pi-wt-");
-}
-
-/** Whether child is root itself or a path underneath it (sibling prefixes do not match). */
-function isPathInside(root: string, child: string): boolean {
-	if (!child) return false;
-	const relative = path.relative(root, canonicalPath(child));
-	return relative === "" ||
-		(!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
-}
-
-interface TmuxWindowPanes {
-	windowId: string;
-	sessionName: string;
-	windowName: string;
-	panePaths: string[];
-}
-
-/** Every tmux window with the working directories of its panes. */
-async function listTmuxWindows(): Promise<TmuxWindowPanes[]> {
-	const res = await exec("tmux", [
-		"list-panes", "-a", "-F", "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
-	]);
-	if (res.exitCode !== 0) return [];
-
-	const windows = new Map<string, TmuxWindowPanes>();
-	for (const line of res.stdout.split("\n")) {
-		const [windowId, sessionName, windowName, panePath] = line.split("\t");
-		if (!/^@\d+$/.test(windowId)) continue;
-		const existing = windows.get(windowId);
-		if (existing) {
-			if (panePath) existing.panePaths.push(panePath);
-		} else {
-			windows.set(windowId, {
-				windowId,
-				sessionName,
-				windowName: windowName ?? "",
-				panePaths: panePath ? [panePath] : [],
-			});
+	async function renameManagedWorktreeRecord(gitRoot: string, oldBranch: string, newBranch: string): Promise<void> {
+		const reg = await loadRegistry(gitRoot);
+		const rec = reg.worktrees[oldBranch];
+		if (rec) {
+			rec.branch = newBranch;
+			delete reg.worktrees[oldBranch];
+			reg.worktrees[newBranch] = rec;
+		}
+		let changed = Boolean(rec);
+		for (const known of reg.known) {
+			const matchesRecord = rec ? sameDirectory(known.path, rec.path) : false;
+			if (matchesRecord || (!rec && known.branch === oldBranch)) {
+				known.branch = newBranch;
+				changed = true;
+			}
+		}
+		if (changed) {
+			await saveRegistry(gitRoot, reg);
 		}
 	}
-	return [...windows.values()];
-}
 
-/** A live window whose panes run inside this checkout, whatever it is named or recorded as. */
-function findWindowInWorktree(windows: TmuxWindowPanes[], worktreePath: string): TmuxWindowPanes | undefined {
-	const root = canonicalPath(worktreePath);
-	return windows.find((window) => window.panePaths.some((panePath) => isPathInside(root, panePath)));
-}
+	// ---------------------------------------------------------------------------
+	// Tmux Helpers
+	// ---------------------------------------------------------------------------
 
-/** Close worktree windows by ID; never kill the shared session that hosts them. */
-async function closeWorktreeTmuxWindows(worktreePath: string, record?: ManagedRecord): Promise<void> {
-	const panes = await exec("tmux", [
-		"list-panes", "-a", "-F", "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
-	]);
-	if (panes.exitCode !== 0) {
-		// No tmux installation/server means there are no windows to close.
-		if (!(await isTmuxAvailable()) || /no server running|No such file or directory/i.test(panes.stderr)) return;
-		throw new Error(`Cannot list tmux windows: ${panes.stderr || panes.stdout}`);
+	async function isTmuxAvailable(): Promise<boolean> {
+		const res = await exec("tmux", ["-V"]);
+		return res.exitCode === 0;
 	}
 
-	const root = canonicalPath(worktreePath);
-	const windows = new Set<string>();
-	for (const line of panes.stdout.split("\n")) {
-		const [windowId, sessionName, windowName, panePath] = line.split("\t");
-		if (!/^@\d+$/.test(windowId)) continue;
-		const inWorktree = isPathInside(root, panePath);
-		// Old creation fallbacks recorded the window name instead of its ID.
-		// Compare literal names here: `wt:topic` is not a valid tmux target expression.
-		const recordedWindow = record?.tmuxWindowId &&
-			((record.tmuxWindowId === windowId && (!record.tmuxSession || record.tmuxSession === sessionName)) ||
-				(record.tmuxWindowId === windowName && record.tmuxSession === sessionName));
-		const dedicatedSession = record && !record.tmuxWindowId &&
-			record.tmuxSession === `pi-wt-${sanitizeBranchForPath(record.branch)}` &&
-			record.tmuxSession === sessionName;
-		if (inWorktree || recordedWindow || dedicatedSession) windows.add(windowId);
+	function isInsideTmux(): boolean {
+		return Boolean(process.env.TMUX);
 	}
 
-	for (const windowId of windows) {
-		const result = await exec("tmux", ["kill-window", "-t", windowId]);
-		// A window may have exited between discovery and cleanup.
-		if (result.exitCode !== 0 && await checkTmuxWindowExists(windowId)) {
-			throw new Error(`Cannot close tmux window ${windowId}: ${result.stderr || result.stdout}`);
+	async function getCurrentTmuxSession(): Promise<string | null> {
+		if (!isInsideTmux()) return null;
+		const res = await exec("tmux", ["display-message", "-p", "#{session_name}"]);
+		return res.exitCode === 0 && res.stdout ? res.stdout : null;
+	}
+
+	async function checkTmuxWindowExists(target: string): Promise<boolean> {
+		const res = await exec("tmux", ["display-message", "-p", "-t", target, "#{window_id}"]);
+		// display-message can succeed with empty output for a missing target.
+		return res.exitCode === 0 && /^@\d+$/.test(res.stdout);
+	}
+
+	async function checkTmuxSessionExists(sessionName: string): Promise<boolean> {
+		const res = await exec("tmux", ["has-session", "-t", sessionName]);
+		return res.exitCode === 0;
+	}
+
+	/** Sessions created by spawnPiInTmux outside tmux; one worktree each. */
+	function isDedicatedWorktreeSession(sessionName: string): boolean {
+		return sessionName.startsWith("pi-wt-");
+	}
+
+	/** Whether child is root itself or a path underneath it (sibling prefixes do not match). */
+	function isPathInside(root: string, child: string): boolean {
+		if (!child) return false;
+		const relative = path.relative(root, canonicalPath(child));
+		return relative === "" ||
+			(!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+	}
+
+	interface TmuxWindowPanes {
+		windowId: string;
+		sessionName: string;
+		windowName: string;
+		panePaths: string[];
+	}
+
+	/** Every tmux window with the working directories of its panes. */
+	async function listTmuxWindows(): Promise<TmuxWindowPanes[]> {
+		const res = await exec("tmux", [
+			"list-panes", "-a", "-F", "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+		]);
+		if (res.exitCode !== 0) return [];
+
+		const windows = new Map<string, TmuxWindowPanes>();
+		for (const line of res.stdout.split("\n")) {
+			const [windowId, sessionName, windowName, panePath] = line.split("\t");
+			if (!/^@\d+$/.test(windowId)) continue;
+			const existing = windows.get(windowId);
+			if (existing) {
+				if (panePath) existing.panePaths.push(panePath);
+			} else {
+				windows.set(windowId, {
+					windowId,
+					sessionName,
+					windowName: windowName ?? "",
+					panePaths: panePath ? [panePath] : [],
+				});
+			}
+		}
+		return [...windows.values()];
+	}
+
+	/** A live window whose panes run inside this checkout, whatever it is named or recorded as. */
+	function findWindowInWorktree(windows: TmuxWindowPanes[], worktreePath: string): TmuxWindowPanes | undefined {
+		const root = canonicalPath(worktreePath);
+		return windows.find((window) => window.panePaths.some((panePath) => isPathInside(root, panePath)));
+	}
+
+	/** Close worktree windows by ID; never kill the shared session that hosts them. */
+	async function closeWorktreeTmuxWindows(worktreePath: string, record?: ManagedRecord): Promise<void> {
+		if (terminal) return terminal.close(worktreePath, record?.terminal);
+		const panes = await exec("tmux", [
+			"list-panes", "-a", "-F", "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+		]);
+		if (panes.exitCode !== 0) {
+			// No tmux installation/server means there are no windows to close.
+			if (!(await isTmuxAvailable()) || /no server running|No such file or directory/i.test(panes.stderr)) return;
+			throw new Error(`Cannot list tmux windows: ${panes.stderr || panes.stdout}`);
+		}
+
+		const root = canonicalPath(worktreePath);
+		const windows = new Set<string>();
+		for (const line of panes.stdout.split("\n")) {
+			const [windowId, sessionName, windowName, panePath] = line.split("\t");
+			if (!/^@\d+$/.test(windowId)) continue;
+			const inWorktree = isPathInside(root, panePath);
+			// Old creation fallbacks recorded the window name instead of its ID.
+			// Compare literal names here: `wt:topic` is not a valid tmux target expression.
+			const recordedWindow = record?.tmuxWindowId &&
+				((record.tmuxWindowId === windowId && (!record.tmuxSession || record.tmuxSession === sessionName)) ||
+					(record.tmuxWindowId === windowName && record.tmuxSession === sessionName));
+			const dedicatedSession = record && !record.tmuxWindowId &&
+				record.tmuxSession === `pi-wt-${sanitizeBranchForPath(record.branch)}` &&
+				record.tmuxSession === sessionName;
+			if (inWorktree || recordedWindow || dedicatedSession) windows.add(windowId);
+		}
+
+		for (const windowId of windows) {
+			const result = await exec("tmux", ["kill-window", "-t", windowId]);
+			// A window may have exited between discovery and cleanup.
+			if (result.exitCode !== 0 && await checkTmuxWindowExists(windowId)) {
+				throw new Error(`Cannot close tmux window ${windowId}: ${result.stderr || result.stdout}`);
+			}
 		}
 	}
-}
 
-interface SpawnTmuxResult {
-	success: boolean;
-	isNewWindow: boolean;
-	tmuxTarget: string;
-	windowIndex?: number;
-	error?: string;
-}
-
-async function spawnPiInTmux(
-	worktreePath: string,
-	branch: string,
-	signal?: AbortSignal,
-): Promise<SpawnTmuxResult> {
-	const hasTmux = await isTmuxAvailable();
-	if (!hasTmux) {
-		return { success: false, isNewWindow: false, tmuxTarget: "", error: "tmux is not installed or not in PATH" };
+	interface SpawnTmuxResult {
+		success: boolean;
+		isNewWindow: boolean;
+		tmuxTarget: string;
+		windowIndex?: number;
+		error?: string;
 	}
 
-	const windowName = `wt:${sanitizeBranchForPath(branch)}`;
-	// Command to run inside tmux: starts pi interactively with session name, no initial prompt!
-	const piCommand = `pi --name "wt:${branch}"`;
+	async function spawnPiInTmux(
+		worktreePath: string,
+		branch: string,
+		signal?: AbortSignal,
+	): Promise<SpawnTmuxResult> {
+		const hasTmux = await isTmuxAvailable();
+		if (!hasTmux) {
+			return { success: false, isNewWindow: false, tmuxTarget: "", error: "tmux is not installed or not in PATH" };
+		}
 
-	if (isInsideTmux()) {
-		// Inside tmux: create a new window in the active session
-		const currentSession = await getCurrentTmuxSession();
-		const targetSession = currentSession ? `${currentSession}:` : "";
+		const windowName = `wt:${sanitizeBranchForPath(branch)}`;
+		// Command to run inside tmux: starts pi interactively with session name, no initial prompt!
+		const piCommand = `pi --name "wt:${branch}"`;
 
-		const res = await exec(
-			"tmux",
-			[
-				"new-window",
-				"-P",
-				"-F",
-				"#{window_id}:#{window_index}",
-				"-t",
-				targetSession,
-				"-n",
-				windowName,
-				"-c",
+		if (isInsideTmux()) {
+			// Inside tmux: create a new window in the active session
+			const currentSession = await getCurrentTmuxSession();
+			const targetSession = currentSession ? `${currentSession}:` : "";
+
+			const res = await exec(
+				"tmux",
+				[
+					"new-window",
+					"-P",
+					"-F",
+					"#{window_id}:#{window_index}",
+					"-t",
+					targetSession,
+					"-n",
+					windowName,
+					"-c",
+					worktreePath,
+					piCommand,
+				],
 				worktreePath,
-				piCommand,
-			],
-			worktreePath,
-			signal,
-		);
+				signal,
+			);
 
-		if (res.exitCode === 0 && res.stdout) {
-			const parts = res.stdout.split(":");
-			const windowId = parts[0];
-			const windowIndex = Number.parseInt(parts[1], 10);
+			if (res.exitCode === 0 && res.stdout) {
+				const parts = res.stdout.split(":");
+				const windowId = parts[0];
+				const windowIndex = Number.parseInt(parts[1], 10);
+				return {
+					success: true,
+					isNewWindow: true,
+					tmuxTarget: windowId,
+					windowIndex: Number.isFinite(windowIndex) ? windowIndex : undefined,
+				};
+			}
+
+			// Fallback: spawn without -P output parsing
+			const fallback = await exec(
+				"tmux",
+				["new-window", "-n", windowName, "-c", worktreePath, piCommand],
+				worktreePath,
+				signal,
+			);
+			if (fallback.exitCode === 0) {
+				return { success: true, isNewWindow: true, tmuxTarget: windowName };
+			}
+			return { success: false, isNewWindow: true, tmuxTarget: "", error: res.stderr || fallback.stderr };
+		}
+
+		// Outside tmux: create a dedicated detached session
+		const sessionName = `pi-wt-${sanitizeBranchForPath(branch)}`;
+		const exists = await checkTmuxSessionExists(sessionName);
+		if (exists) {
 			return {
 				success: true,
-				isNewWindow: true,
-				tmuxTarget: windowId,
-				windowIndex: Number.isFinite(windowIndex) ? windowIndex : undefined,
+				isNewWindow: false,
+				tmuxTarget: sessionName,
 			};
 		}
 
-		// Fallback: spawn without -P output parsing
-		const fallback = await exec(
+		const res = await exec(
 			"tmux",
-			["new-window", "-n", windowName, "-c", worktreePath, piCommand],
+			["new-session", "-d", "-s", sessionName, "-c", worktreePath, piCommand],
 			worktreePath,
 			signal,
 		);
-		if (fallback.exitCode === 0) {
-			return { success: true, isNewWindow: true, tmuxTarget: windowName };
+
+		if (res.exitCode === 0) {
+			return {
+				success: true,
+				isNewWindow: false,
+				tmuxTarget: sessionName,
+			};
 		}
-		return { success: false, isNewWindow: true, tmuxTarget: "", error: res.stderr || fallback.stderr };
+
+		return { success: false, isNewWindow: false, tmuxTarget: "", error: res.stderr };
 	}
 
-	// Outside tmux: create a dedicated detached session
-	const sessionName = `pi-wt-${sanitizeBranchForPath(branch)}`;
-	const exists = await checkTmuxSessionExists(sessionName);
-	if (exists) {
-		return {
-			success: true,
-			isNewWindow: false,
-			tmuxTarget: sessionName,
-		};
+	interface ResolvedTmuxWindow {
+		windowId: string;
+		sessionName: string;
 	}
 
-	const res = await exec(
-		"tmux",
-		["new-session", "-d", "-s", sessionName, "-c", worktreePath, piCommand],
-		worktreePath,
-		signal,
-	);
-
-	if (res.exitCode === 0) {
-		return {
-			success: true,
-			isNewWindow: false,
-			tmuxTarget: sessionName,
-		};
+	async function resolveTmuxWindow(target: string): Promise<ResolvedTmuxWindow | null> {
+		const res = await exec("tmux", ["display-message", "-p", "-t", target, "#{window_id}\t#{session_name}"]);
+		// display-message can succeed with empty output for a missing target.
+		const [windowId, sessionName] = res.exitCode === 0 ? res.stdout.split("\t") : [];
+		if (!/^@\d+$/.test(windowId ?? "") || !sessionName) return null;
+		return { windowId, sessionName };
 	}
 
-	return { success: false, isNewWindow: false, tmuxTarget: "", error: res.stderr };
-}
-
-interface ResolvedTmuxWindow {
-	windowId: string;
-	sessionName: string;
-}
-
-async function resolveTmuxWindow(target: string): Promise<ResolvedTmuxWindow | null> {
-	const res = await exec("tmux", ["display-message", "-p", "-t", target, "#{window_id}\t#{session_name}"]);
-	// display-message can succeed with empty output for a missing target.
-	const [windowId, sessionName] = res.exitCode === 0 ? res.stdout.split("\t") : [];
-	if (!/^@\d+$/.test(windowId ?? "") || !sessionName) return null;
-	return { windowId, sessionName };
-}
-
-async function windowRunsInWorktree(windowId: string, worktreePath: string): Promise<boolean> {
-	const res = await exec("tmux", ["list-panes", "-t", windowId, "-F", "#{pane_current_path}"]);
-	if (res.exitCode !== 0) return false;
-	const root = canonicalPath(worktreePath);
-	return res.stdout.split("\n").some((line) => isPathInside(root, line.trim()));
-}
-
-/**
- * Move the caller to a worktree's tmux window. With worktreePath, the target
- * must resolve to a live window running in that checkout: tmux resolves a
- * bare session name as a window target to that session's current window —
- * the window the caller is already looking at — so an unverified target can
- * switch nowhere while reporting success. A window in another session is
- * reached with switch-client, since select-window only changes that
- * session's current window without moving the caller's client.
- */
-async function switchToTmuxTarget(target: string, worktreePath?: string): Promise<{ success: boolean; error?: string }> {
-	if (!isInsideTmux()) return { success: true };
-	const resolved = await resolveTmuxWindow(target);
-	if (!resolved) return { success: false, error: `cannot resolve tmux window "${target}"` };
-	if (worktreePath && !(await windowRunsInWorktree(resolved.windowId, worktreePath))) {
-		return { success: false, error: `tmux window "${target}" is not running in ${worktreePath}` };
+	async function windowRunsInWorktree(windowId: string, worktreePath: string): Promise<boolean> {
+		const res = await exec("tmux", ["list-panes", "-t", windowId, "-F", "#{pane_current_path}"]);
+		if (res.exitCode !== 0) return false;
+		const root = canonicalPath(worktreePath);
+		return res.stdout.split("\n").some((line) => isPathInside(root, line.trim()));
 	}
-	const currentSession = await getCurrentTmuxSession();
-	if (currentSession && resolved.sessionName !== currentSession) {
-		const res = await exec("tmux", ["switch-client", "-t", resolved.sessionName]);
+
+	/**
+	 * Move the caller to a worktree's tmux window. With worktreePath, the target
+	 * must resolve to a live window running in that checkout: tmux resolves a
+	 * bare session name as a window target to that session's current window —
+	 * the window the caller is already looking at — so an unverified target can
+	 * switch nowhere while reporting success. A window in another session is
+	 * reached with switch-client, since select-window only changes that
+	 * session's current window without moving the caller's client.
+	 */
+	async function switchToTmuxTarget(target: string, worktreePath?: string): Promise<{ success: boolean; error?: string }> {
+		if (!isInsideTmux()) return { success: true };
+		const resolved = await resolveTmuxWindow(target);
+		if (!resolved) return { success: false, error: `cannot resolve tmux window "${target}"` };
+		if (worktreePath && !(await windowRunsInWorktree(resolved.windowId, worktreePath))) {
+			return { success: false, error: `tmux window "${target}" is not running in ${worktreePath}` };
+		}
+		const currentSession = await getCurrentTmuxSession();
+		if (currentSession && resolved.sessionName !== currentSession) {
+			const res = await exec("tmux", ["switch-client", "-t", resolved.sessionName]);
+			if (res.exitCode === 0) return { success: true };
+			return { success: false, error: res.stderr };
+		}
+		const res = await exec("tmux", ["select-window", "-t", resolved.windowId]);
 		if (res.exitCode === 0) return { success: true };
 		return { success: false, error: res.stderr };
 	}
-	const res = await exec("tmux", ["select-window", "-t", resolved.windowId]);
-	if (res.exitCode === 0) return { success: true };
-	return { success: false, error: res.stderr };
-}
 
-// ---------------------------------------------------------------------------
-// High-Level Worktree Operations
-// ---------------------------------------------------------------------------
+	// ---------------------------------------------------------------------------
+	// High-Level Worktree Operations
+	// ---------------------------------------------------------------------------
 
-async function getAllWorktreeStatuses(gitRoot: string): Promise<FullWorktreeStatus[]> {
-	const gitWorktrees = await getGitWorktrees(gitRoot);
-	const reg = await loadRegistry(gitRoot);
-	const paneWindows = await listTmuxWindows();
-
-	const statuses: FullWorktreeStatus[] = [];
-
-	for (const wt of gitWorktrees) {
-		const isMain = path.resolve(wt.path) === path.resolve(gitRoot);
-		const branch = wt.branch ?? "";
-		const record = branch ? reg.worktrees[branch] : undefined;
-		const isManaged = Boolean(record);
-
-		let tmuxActive = false;
-		let tmuxTarget: string | undefined;
-
-		// Primary target: the window recorded at creation, even if its panes
-		// have since changed directory.
-		if (record?.tmuxWindowId && (await checkTmuxWindowExists(record.tmuxWindowId))) {
-			tmuxActive = true;
-			tmuxTarget = record.tmuxWindowId;
-		}
-
-		// Live discovery: any window whose panes run inside this checkout,
-		// whatever it is named or which tool created it. This catches renamed
-		// windows, windows started by other tools, and stale recorded window
-		// IDs. The primary checkout is skipped: its windows (including this
-		// one) always match its own path.
-		if (!tmuxActive && !isMain) {
-			const found = findWindowInWorktree(paneWindows, wt.path);
-			if (found) {
-				tmuxActive = true;
-				// A dedicated session is switched to as a whole: its windows live in
-				// a different session than the caller's client.
-				tmuxTarget = isDedicatedWorktreeSession(found.sessionName) ? found.sessionName : found.windowId;
-			}
-		}
-
-		// Dedicated detached sessions (worktrees created outside tmux). A
-		// recorded shared session is never a target: it is alive whenever its
-		// parent session is, and tmux resolves its bare name to the caller's own
-		// current window, making a switch there a silent no-op.
-		if (!tmuxActive && branch) {
-			const dedicatedSessions = [record?.tmuxSession, `pi-wt-${sanitizeBranchForPath(branch)}`]
-				.filter((name): name is string => Boolean(name && isDedicatedWorktreeSession(name)));
-			for (const sessionName of dedicatedSessions) {
-				if (await checkTmuxSessionExists(sessionName)) {
-					tmuxActive = true;
-					tmuxTarget = sessionName;
-					break;
-				}
-			}
-		}
-
-		statuses.push({
-			...wt,
-			isMain,
-			isManaged,
-			managedRecord: record,
-			tmuxActive,
-			tmuxTarget,
-		});
-	}
-
-	return statuses;
-}
-
-interface CreateWorktreeOptions {
-	branch: string;
-	baseBranch?: string;
-	/** Directory the command was run from. Used for the default base branch. */
-	invokedFrom?: string;
-	signal?: AbortSignal;
-}
-
-interface CreateWorktreeResult {
-	success: boolean;
-	worktreePath: string;
-	branch: string;
-	tmuxTarget?: string;
-	windowIndex?: number;
-	isInsideTmux: boolean;
-	error?: string;
-}
-
-async function createWorktreeAndSpawnPi(
-	gitRoot: string,
-	options: CreateWorktreeOptions,
-): Promise<CreateWorktreeResult> {
-	const { branch, baseBranch, invokedFrom, signal } = options;
-	const worktreePath = computeWorktreePath(gitRoot, branch);
-
-	// Check if path already exists
-	if (fs.existsSync(worktreePath)) {
-		return {
-			success: false,
-			worktreePath,
-			branch,
-			isInsideTmux: isInsideTmux(),
-			error: `Directory already exists: ${worktreePath}`,
-		};
-	}
-
-	// Check if branch already exists in git
-	const branchExists = await checkBranchExists(gitRoot, branch);
-	let addResult: { stdout: string; stderr: string; exitCode: number };
-
-	if (branchExists) {
-		// Checkout existing branch into new worktree
-		addResult = await exec("git", ["worktree", "add", worktreePath, branch], gitRoot, signal);
-	} else {
-		// Create new branch
-		const args = ["worktree", "add", "-b", branch, worktreePath];
-		if (baseBranch) {
-			args.push(baseBranch);
-		}
-		addResult = await exec("git", args, gitRoot, signal);
-	}
-
-	if (addResult.exitCode !== 0) {
-		return {
-			success: false,
-			worktreePath,
-			branch,
-			isInsideTmux: isInsideTmux(),
-			error: `git worktree add failed: ${addResult.stderr || addResult.stdout}`,
-		};
-	}
-
-	// Spawn Pi inside tmux
-	const tmuxRes = await spawnPiInTmux(worktreePath, branch, signal);
-
-	// Register in metadata
-	const record: ManagedRecord = {
-		branch,
-		path: worktreePath,
-		baseBranch: baseBranch || (await getCurrentBranch(invokedFrom || gitRoot)),
-		createdAt: Date.now(),
-		tmuxSession: isInsideTmux() ? await getCurrentTmuxSession() || undefined : tmuxRes.tmuxTarget,
-		tmuxWindowId: isInsideTmux() ? tmuxRes.tmuxTarget : undefined,
-		tmuxWindowIndex: tmuxRes.windowIndex,
-	};
-	await registerManagedWorktree(gitRoot, record);
-
-	return {
-		success: true,
-		worktreePath,
-		branch,
-		tmuxTarget: tmuxRes.tmuxTarget,
-		windowIndex: tmuxRes.windowIndex,
-		isInsideTmux: isInsideTmux(),
-		error: tmuxRes.error,
-	};
-}
-
-interface CleanWorktreesResult {
-	cleaned: Array<{ branch: string; path: string }>;
-	failed: Array<{ branch: string; error: string }>;
-}
-
-async function cleanManagedWorktrees(gitRoot: string): Promise<CleanWorktreesResult> {
-	const reg = await loadRegistry(gitRoot);
-	const entries = Object.values(reg.worktrees);
-
-	const cleaned: Array<{ branch: string; path: string }> = [];
-	const failed: Array<{ branch: string; error: string }> = [];
-
-	for (const rec of entries) {
-		try {
-			// 1. Close only this worktree's tmux windows.
-			await closeWorktreeTmuxWindows(rec.path, rec);
-
-			// 2. Remove git worktree
-			const rmRes = await exec("git", ["worktree", "remove", "--force", rec.path], gitRoot);
-			if (rmRes.exitCode !== 0) {
-				// If git worktree remove fails, try deleting directory manually
-				try {
-					await fs.promises.rm(rec.path, { recursive: true, force: true });
-				} catch {
-					// Ignore
-				}
-			}
-
-			// 3. Delete git branch
-			await exec("git", ["branch", "-D", rec.branch], gitRoot);
-
-			// 4. Remove from registry
-			await unregisterManagedWorktree(gitRoot, rec.branch);
-
-			cleaned.push({ branch: rec.branch, path: rec.path });
-		} catch (err: any) {
-			failed.push({ branch: rec.branch, error: err.message || String(err) });
-		}
-	}
-
-	// Prune git worktree administrative files
-	await exec("git", ["worktree", "prune"], gitRoot);
-
-	return { cleaned, failed };
-}
-
-async function removeSingleWorktree(
-	gitRoot: string,
-	branch: string,
-	deleteBranch = true,
-): Promise<{ success: boolean; error?: string }> {
-	const statuses = await getAllWorktreeStatuses(gitRoot);
-	const target = statuses.find((s) => s.branch === branch);
-
-	if (!target) {
-		return { success: false, error: `Worktree for branch "${branch}" not found` };
-	}
-	if (target.isMain) {
-		return { success: false, error: "Cannot remove the main repository worktree" };
-	}
-
-	// 1. Close its windows even when metadata is missing or the command runs outside tmux.
-	try {
-		await closeWorktreeTmuxWindows(target.path, target.managedRecord);
-	} catch (error) {
-		return { success: false, error: error instanceof Error ? error.message : String(error) };
-	}
-
-	// 2. Remove git worktree
-	const rmRes = await exec("git", ["worktree", "remove", "--force", target.path], gitRoot);
-	if (rmRes.exitCode !== 0) {
-		try {
-			await fs.promises.rm(target.path, { recursive: true, force: true });
-		} catch {
-			// Ignore
-		}
-	}
-
-	// 3. Delete branch
-	if (deleteBranch) {
-		await exec("git", ["branch", "-D", branch], gitRoot);
-	}
-
-	// 4. Remove from registry
-	await unregisterManagedWorktree(gitRoot, branch);
-
-	// 5. Prune
-	await exec("git", ["worktree", "prune"], gitRoot);
-
-	return { success: true };
-}
-
-async function renameWorktreeBranch(
-	gitRoot: string,
-	oldBranch: string,
-	newBranch: string,
-): Promise<{ success: boolean; error?: string }> {
-	const branchExists = await checkBranchExists(gitRoot, oldBranch);
-	if (!branchExists) {
-		return { success: false, error: `Branch "${oldBranch}" does not exist` };
-	}
-
-	const newExists = await checkBranchExists(gitRoot, newBranch);
-	if (newExists) {
-		return { success: false, error: `Branch "${newBranch}" already exists` };
-	}
-
-	// Rename git branch
-	const res = await exec("git", ["branch", "-m", oldBranch, newBranch], gitRoot);
-	if (res.exitCode !== 0) {
-		return { success: false, error: res.stderr || "Failed to rename git branch" };
-	}
-
-	// Update registry
-	await renameManagedWorktreeRecord(gitRoot, oldBranch, newBranch);
-
-	// If in tmux, attempt to rename window
-	if (isInsideTmux()) {
-		const oldWindowName = `wt:${sanitizeBranchForPath(oldBranch)}`;
-		const newWindowName = `wt:${sanitizeBranchForPath(newBranch)}`;
-		await exec("tmux", ["rename-window", "-t", oldWindowName, newWindowName]);
-	}
-
-	return { success: true };
-}
-
-// ---------------------------------------------------------------------------
-// Worktree sessions
-// ---------------------------------------------------------------------------
-
-interface WorktreeSessionSource {
-	branch: string;
-	path: string;
-}
-
-/**
- * Paths whose sessions /worktree sessions should list.
- * Recorded worktrees win. `git worktree list` is used only when nothing has been written down.
- */
-async function getSessionWorktreeSources(gitRoot: string): Promise<WorktreeSessionSource[]> {
-	const reg = await loadRegistry(gitRoot);
-	if (reg.known.length > 0) {
-		const seen = new Set<string>();
-		const sources: WorktreeSessionSource[] = [];
-		for (const known of reg.known) {
-			const resolved = canonicalPath(known.path);
-			if (seen.has(resolved)) continue;
-			seen.add(resolved);
-			sources.push({ branch: known.branch, path: known.path });
-		}
-		return sources;
-	}
-	const gitWorktrees = await getGitWorktrees(gitRoot);
-	return gitWorktrees
-		.filter((wt) => !wt.bare && wt.path)
-		.map((wt) => ({ branch: wt.branch ?? "(detached)", path: wt.path }));
-}
-
-function truncateText(text: string, max: number): string {
-	const oneLine = text.replace(/\s+/g, " ").trim();
-	if (oneLine.length <= max) return oneLine;
-	return `${oneLine.slice(0, Math.max(0, max - 1))}…`;
-}
-
-async function listWorktreeSessions(
-	gitRoot: string,
-	signal?: AbortSignal,
-	sessionDir?: string,
-): Promise<WorktreeSessionRow[]> {
-	const sources = await getSessionWorktreeSources(gitRoot);
-	const listed: WorktreeSessionRow[] = [];
-	for (const source of sources) {
-		if (signal?.aborted) break;
-		let sessions: SessionInfo[] = [];
-		try {
-			sessions = await SessionManager.list(source.path, sessionDir, undefined, signal);
-		} catch {
-			if (signal?.aborted) break;
-			continue;
-		}
-		const missing = !directoryExists(source.path);
-		for (const session of sessions) {
-			listed.push(toWorktreeSessionRow(session, { branch: source.branch, path: source.path, missing }));
-		}
-	}
-	listed.sort((a, b) => b.session.modified.getTime() - a.session.modified.getTime());
-	return listed;
-}
-
-async function branchForDirectory(dir: string): Promise<string> {
-	const res = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], dir);
-	if (res.exitCode !== 0 || !res.stdout || res.stdout === "HEAD") return "(detached)";
-	return res.stdout;
-}
-
-async function loadCurrentFolderRows(
-	cwd: string,
-	gitRoot: string,
-	sessionDir: string | undefined,
-	signal?: AbortSignal,
-): Promise<WorktreeSessionRow[]> {
-	const sessions = await SessionManager.list(cwd, sessionDir, undefined, signal);
-	const sources = await getSessionWorktreeSources(gitRoot);
-	const source = sources.find((item) => sameDirectory(item.path, cwd));
-	const branch = source?.branch ?? (await branchForDirectory(cwd));
-	return sessions
-		.slice()
-		.sort((a, b) => b.modified.getTime() - a.modified.getTime())
-		.map((session) =>
-			toWorktreeSessionRow(session, {
-				branch,
-				path: source?.path ?? cwd,
-				missing: !directoryExists(source?.path ?? cwd),
-			}),
-		);
-}
-
-function formatSessionChoice(item: WorktreeSessionRow, index: number): string {
-	const title = item.session.name?.trim() || truncateText(item.session.firstMessage, 48) || "(empty)";
-	const when = item.session.modified.toISOString().slice(0, 16).replace("T", " ");
-	const state = item.missing ? "missing" : "present";
-	return `${index + 1}. ${item.branch} · ${item.worktreeName} [${state}] ${title} (${when})`;
-}
-
-interface DestinationChoice {
-	label: string;
-	path: string;
-}
-
-async function listResumeDestinations(gitRoot: string, currentCwd: string): Promise<DestinationChoice[]> {
-	const choices: DestinationChoice[] = [];
-	const add = (label: string, dir: string) => {
-		if (!directoryExists(dir)) return;
-		const resolved = canonicalPath(dir);
-		if (choices.some((choice) => choice.path === resolved)) return;
-		choices.push({ label, path: resolved });
-	};
-
-	add(`Current folder (${currentCwd})`, currentCwd);
-
-	const reg = await loadRegistry(gitRoot);
-	if (reg.known.length > 0) {
-		for (const known of reg.known) {
-			add(`${known.branch} (${known.path})`, known.path);
-		}
-	} else {
+	async function getAllWorktreeStatuses(gitRoot: string): Promise<FullWorktreeStatus[]> {
 		const gitWorktrees = await getGitWorktrees(gitRoot);
+		const reg = await loadRegistry(gitRoot);
+		const paneWindows = terminal ? [] : await listTmuxWindows();
+		const terminalTargets = terminal ? await terminal.findMany(gitWorktrees
+			.filter((worktree) => path.resolve(worktree.path) !== path.resolve(gitRoot))
+			.map((worktree) => ({ path: worktree.path, terminal: reg.worktrees[worktree.branch ?? ""]?.terminal }))) : undefined;
+
+		const statuses: FullWorktreeStatus[] = [];
+
 		for (const wt of gitWorktrees) {
-			if (wt.bare) continue;
-			add(`${wt.branch ?? "(detached)"} (${wt.path})`, wt.path);
+			const isMain = path.resolve(wt.path) === path.resolve(gitRoot);
+			const branch = wt.branch ?? "";
+			const record = branch ? reg.worktrees[branch] : undefined;
+			const isManaged = Boolean(record);
+
+			if (terminal) {
+				const target = terminalTargets?.get(wt.path);
+				statuses.push({ ...wt, isMain, isManaged, managedRecord: record, tmuxActive: false,
+					terminalActive: Boolean(target), terminalLabel: terminal.label, terminalTarget: target });
+				continue;
+			}
+
+			let tmuxActive = false;
+			let tmuxTarget: string | undefined;
+
+			// Primary target: the window recorded at creation, even if its panes
+			// have since changed directory.
+			if (record?.tmuxWindowId && (await checkTmuxWindowExists(record.tmuxWindowId))) {
+				tmuxActive = true;
+				tmuxTarget = record.tmuxWindowId;
+			}
+
+			// Live discovery: any window whose panes run inside this checkout,
+			// whatever it is named or which tool created it. This catches renamed
+			// windows, windows started by other tools, and stale recorded window
+			// IDs. The primary checkout is skipped: its windows (including this
+			// one) always match its own path.
+			if (!tmuxActive && !isMain) {
+				const found = findWindowInWorktree(paneWindows, wt.path);
+				if (found) {
+					tmuxActive = true;
+					// A dedicated session is switched to as a whole: its windows live in
+					// a different session than the caller's client.
+					tmuxTarget = isDedicatedWorktreeSession(found.sessionName) ? found.sessionName : found.windowId;
+				}
+			}
+
+			// Dedicated detached sessions (worktrees created outside tmux). A
+			// recorded shared session is never a target: it is alive whenever its
+			// parent session is, and tmux resolves its bare name to the caller's own
+			// current window, making a switch there a silent no-op.
+			if (!tmuxActive && branch) {
+				const dedicatedSessions = [record?.tmuxSession, `pi-wt-${sanitizeBranchForPath(branch)}`]
+					.filter((name): name is string => Boolean(name && isDedicatedWorktreeSession(name)));
+				for (const sessionName of dedicatedSessions) {
+					if (await checkTmuxSessionExists(sessionName)) {
+						tmuxActive = true;
+						tmuxTarget = sessionName;
+						break;
+					}
+				}
+			}
+
+			statuses.push({
+				...wt,
+				isMain,
+				isManaged,
+				managedRecord: record,
+				tmuxActive,
+				tmuxTarget,
+			});
 		}
+
+		return statuses;
 	}
-	return choices;
-}
 
-const OTHER_FOLDER_CHOICE = "Other folder...";
+	interface CreateWorktreeOptions {
+		branch: string;
+		baseBranch?: string;
+		/** Directory the command was run from. Used for the default base branch. */
+		invokedFrom?: string;
+		signal?: AbortSignal;
+	}
 
-async function handleSessionsCommand(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	const customDir = sessionUsesCustomDir(ctx) ? ctx.sessionManager.getSessionDir() : undefined;
-	let picked: WorktreeSessionRow | null = null;
+	interface CreateWorktreeResult {
+		success: boolean;
+		worktreePath: string;
+		branch: string;
+		tmuxTarget?: string;
+		windowIndex?: number;
+		isInsideTmux: boolean;
+		terminalTarget?: TerminalTarget;
+		error?: string;
+	}
 
-	if (ctx.mode === "tui") {
-		picked = await ctx.ui.custom<WorktreeSessionRow | null>((tui, theme, keybindings, done) => {
-			const visible = Math.max(8, (tui.terminal?.rows ?? 24) - 8);
-			return new WorktreeSessionSelector({
-				theme,
-				keybindings,
-				requestRender: () => tui.requestRender(),
-				maxVisible: visible,
-				currentSessionFilePath: ctx.sessionManager.getSessionFile() ?? undefined,
-				loadCurrent: (signal) => loadCurrentFolderRows(ctx.cwd, gitRoot, ctx.sessionManager.getSessionDir(), signal),
-				loadWorktrees: (signal) => listWorktreeSessions(gitRoot, signal, customDir),
-				onSelect: (row) => done(row),
-				onCancel: () => done(null),
-				renameSession: async (sessionPath, nextName) => {
-					await renameSessionFile(sessionPath, nextName);
+	async function createWorktreeAndSpawnPi(
+		gitRoot: string,
+		options: CreateWorktreeOptions,
+	): Promise<CreateWorktreeResult> {
+		const { branch, baseBranch, invokedFrom, signal } = options;
+		const worktreePath = computeWorktreePath(gitRoot, branch);
+
+		// Check if path already exists
+		if (fs.existsSync(worktreePath)) {
+			return {
+				success: false,
+				worktreePath,
+				branch,
+				isInsideTmux: isInsideTmux(),
+				error: `Directory already exists: ${worktreePath}`,
+			};
+		}
+
+		// Check if branch already exists in git
+		const branchExists = await checkBranchExists(gitRoot, branch);
+		let addResult: { stdout: string; stderr: string; exitCode: number };
+
+		if (branchExists) {
+			// Checkout existing branch into new worktree
+			addResult = await exec("git", ["worktree", "add", worktreePath, branch], gitRoot, signal);
+		} else {
+			// Create new branch
+			const args = ["worktree", "add", "-b", branch, worktreePath];
+			if (baseBranch) {
+				args.push(baseBranch);
+			}
+			addResult = await exec("git", args, gitRoot, signal);
+		}
+
+		if (addResult.exitCode !== 0) {
+			return {
+				success: false,
+				worktreePath,
+				branch,
+				isInsideTmux: isInsideTmux(),
+				error: `git worktree add failed: ${addResult.stderr || addResult.stdout}`,
+			};
+		}
+
+		if (terminal) {
+			// Keep the checkout registered if terminal startup fails so switch can retry it.
+			const record: ManagedRecord = { branch, path: worktreePath,
+				baseBranch: baseBranch || (await getCurrentBranch(invokedFrom || gitRoot)), createdAt: Date.now() };
+			await registerManagedWorktree(gitRoot, record);
+			try {
+				record.terminal = await terminal.spawn(worktreePath, branch, signal);
+				await registerManagedWorktree(gitRoot, record);
+				return { success: true, worktreePath, branch, isInsideTmux: false, terminalTarget: record.terminal };
+			} catch (error) {
+				return { success: false, worktreePath, branch, isInsideTmux: false,
+					error: `Checkout created at ${worktreePath}, but ${terminal.label} startup failed: ${error instanceof Error ? error.message : String(error)}. Retry with /worktree switch ${branch}.` };
+			}
+		}
+
+		// Spawn Pi inside tmux
+		const tmuxRes = await spawnPiInTmux(worktreePath, branch, signal);
+
+		// Register in metadata
+		const record: ManagedRecord = {
+			branch,
+			path: worktreePath,
+			baseBranch: baseBranch || (await getCurrentBranch(invokedFrom || gitRoot)),
+			createdAt: Date.now(),
+			tmuxSession: isInsideTmux() ? await getCurrentTmuxSession() || undefined : tmuxRes.tmuxTarget,
+			tmuxWindowId: isInsideTmux() ? tmuxRes.tmuxTarget : undefined,
+			tmuxWindowIndex: tmuxRes.windowIndex,
+		};
+		await registerManagedWorktree(gitRoot, record);
+
+		return {
+			success: true,
+			worktreePath,
+			branch,
+			tmuxTarget: tmuxRes.tmuxTarget,
+			windowIndex: tmuxRes.windowIndex,
+			isInsideTmux: isInsideTmux(),
+			error: tmuxRes.error,
+		};
+	}
+
+	interface CleanWorktreesResult {
+		cleaned: Array<{ branch: string; path: string }>;
+		failed: Array<{ branch: string; error: string }>;
+	}
+
+	async function cleanManagedWorktrees(gitRoot: string): Promise<CleanWorktreesResult> {
+		const reg = await loadRegistry(gitRoot);
+		const entries = Object.values(reg.worktrees);
+
+		const cleaned: Array<{ branch: string; path: string }> = [];
+		const failed: Array<{ branch: string; error: string }> = [];
+
+		for (const rec of entries) {
+			try {
+				// 1. Close only this worktree's tmux windows.
+				await closeWorktreeTmuxWindows(rec.path, rec);
+
+				// 2. Remove git worktree
+				const rmRes = await exec("git", ["worktree", "remove", "--force", rec.path], gitRoot);
+				if (rmRes.exitCode !== 0) {
+					// If git worktree remove fails, try deleting directory manually
+					try {
+						await fs.promises.rm(rec.path, { recursive: true, force: true });
+					} catch {
+						// Ignore
+					}
+				}
+
+				// 3. Delete git branch
+				await exec("git", ["branch", "-D", rec.branch], gitRoot);
+
+				// 4. Remove from registry
+				await unregisterManagedWorktree(gitRoot, rec.branch);
+
+				cleaned.push({ branch: rec.branch, path: rec.path });
+			} catch (err: any) {
+				failed.push({ branch: rec.branch, error: err.message || String(err) });
+			}
+		}
+
+		// Prune git worktree administrative files
+		await exec("git", ["worktree", "prune"], gitRoot);
+
+		return { cleaned, failed };
+	}
+
+	async function removeSingleWorktree(
+		gitRoot: string,
+		branch: string,
+		deleteBranch = true,
+	): Promise<{ success: boolean; error?: string }> {
+		const statuses = await getAllWorktreeStatuses(gitRoot);
+		const target = statuses.find((s) => s.branch === branch);
+
+		if (!target) {
+			return { success: false, error: `Worktree for branch "${branch}" not found` };
+		}
+		if (target.isMain) {
+			return { success: false, error: "Cannot remove the main repository worktree" };
+		}
+
+		// 1. Close its windows even when metadata is missing or the command runs outside tmux.
+		try {
+			await closeWorktreeTmuxWindows(target.path, target.managedRecord);
+		} catch (error) {
+			return { success: false, error: error instanceof Error ? error.message : String(error) };
+		}
+
+		// 2. Remove git worktree
+		const rmRes = await exec("git", ["worktree", "remove", "--force", target.path], gitRoot);
+		if (rmRes.exitCode !== 0) {
+			try {
+				await fs.promises.rm(target.path, { recursive: true, force: true });
+			} catch {
+				// Ignore
+			}
+		}
+
+		// 3. Delete branch
+		if (deleteBranch) {
+			await exec("git", ["branch", "-D", branch], gitRoot);
+		}
+
+		// 4. Remove from registry
+		await unregisterManagedWorktree(gitRoot, branch);
+
+		// 5. Prune
+		await exec("git", ["worktree", "prune"], gitRoot);
+
+		return { success: true };
+	}
+
+	async function renameWorktreeBranch(
+		gitRoot: string,
+		oldBranch: string,
+		newBranch: string,
+	): Promise<{ success: boolean; error?: string }> {
+		const branchExists = await checkBranchExists(gitRoot, oldBranch);
+		if (!branchExists) {
+			return { success: false, error: `Branch "${oldBranch}" does not exist` };
+		}
+
+		const newExists = await checkBranchExists(gitRoot, newBranch);
+		if (newExists) {
+			return { success: false, error: `Branch "${newBranch}" already exists` };
+		}
+
+		// Rename git branch
+		const res = await exec("git", ["branch", "-m", oldBranch, newBranch], gitRoot);
+		if (res.exitCode !== 0) {
+			return { success: false, error: res.stderr || "Failed to rename git branch" };
+		}
+
+		// Update registry
+		await renameManagedWorktreeRecord(gitRoot, oldBranch, newBranch);
+
+		if (terminal) {
+			const record = (await loadRegistry(gitRoot)).worktrees[newBranch];
+			const checkout = (await getGitWorktrees(gitRoot)).find((worktree) => worktree.branch === newBranch);
+			try {
+				if (checkout) await terminal.rename(checkout.path, newBranch, record?.terminal);
+			} catch (error) {
+				return { success: false, error: `Branch renamed to ${newBranch}, but ${terminal.label} tab rename failed: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
+
+		// If in tmux, attempt to rename window
+		if (!terminal && isInsideTmux()) {
+			const oldWindowName = `wt:${sanitizeBranchForPath(oldBranch)}`;
+			const newWindowName = `wt:${sanitizeBranchForPath(newBranch)}`;
+			await exec("tmux", ["rename-window", "-t", oldWindowName, newWindowName]);
+		}
+
+		return { success: true };
+	}
+
+	// ---------------------------------------------------------------------------
+	// Worktree sessions
+	// ---------------------------------------------------------------------------
+
+	interface WorktreeSessionSource {
+		branch: string;
+		path: string;
+	}
+
+	/**
+	 * Paths whose sessions /worktree sessions should list.
+	 * Recorded worktrees win. `git worktree list` is used only when nothing has been written down.
+	 */
+	async function getSessionWorktreeSources(gitRoot: string): Promise<WorktreeSessionSource[]> {
+		const reg = await loadRegistry(gitRoot);
+		if (reg.known.length > 0) {
+			const seen = new Set<string>();
+			const sources: WorktreeSessionSource[] = [];
+			for (const known of reg.known) {
+				const resolved = canonicalPath(known.path);
+				if (seen.has(resolved)) continue;
+				seen.add(resolved);
+				sources.push({ branch: known.branch, path: known.path });
+			}
+			return sources;
+		}
+		const gitWorktrees = await getGitWorktrees(gitRoot);
+		return gitWorktrees
+			.filter((wt) => !wt.bare && wt.path)
+			.map((wt) => ({ branch: wt.branch ?? "(detached)", path: wt.path }));
+	}
+
+	function truncateText(text: string, max: number): string {
+		const oneLine = text.replace(/\s+/g, " ").trim();
+		if (oneLine.length <= max) return oneLine;
+		return `${oneLine.slice(0, Math.max(0, max - 1))}…`;
+	}
+
+	async function listWorktreeSessions(
+		gitRoot: string,
+		signal?: AbortSignal,
+		sessionDir?: string,
+	): Promise<WorktreeSessionRow[]> {
+		const sources = await getSessionWorktreeSources(gitRoot);
+		const listed: WorktreeSessionRow[] = [];
+		for (const source of sources) {
+			if (signal?.aborted) break;
+			let sessions: SessionInfo[] = [];
+			try {
+				sessions = await SessionManager.list(source.path, sessionDir, undefined, signal);
+			} catch {
+				if (signal?.aborted) break;
+				continue;
+			}
+			const missing = !directoryExists(source.path);
+			for (const session of sessions) {
+				listed.push(toWorktreeSessionRow(session, { branch: source.branch, path: source.path, missing }));
+			}
+		}
+		listed.sort((a, b) => b.session.modified.getTime() - a.session.modified.getTime());
+		return listed;
+	}
+
+	async function branchForDirectory(dir: string): Promise<string> {
+		const res = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], dir);
+		if (res.exitCode !== 0 || !res.stdout || res.stdout === "HEAD") return "(detached)";
+		return res.stdout;
+	}
+
+	async function loadCurrentFolderRows(
+		cwd: string,
+		gitRoot: string,
+		sessionDir: string | undefined,
+		signal?: AbortSignal,
+	): Promise<WorktreeSessionRow[]> {
+		const sessions = await SessionManager.list(cwd, sessionDir, undefined, signal);
+		const sources = await getSessionWorktreeSources(gitRoot);
+		const source = sources.find((item) => sameDirectory(item.path, cwd));
+		const branch = source?.branch ?? (await branchForDirectory(cwd));
+		return sessions
+			.slice()
+			.sort((a, b) => b.modified.getTime() - a.modified.getTime())
+			.map((session) =>
+				toWorktreeSessionRow(session, {
+					branch,
+					path: source?.path ?? cwd,
+					missing: !directoryExists(source?.path ?? cwd),
+				}),
+			);
+	}
+
+	function formatSessionChoice(item: WorktreeSessionRow, index: number): string {
+		const title = item.session.name?.trim() || truncateText(item.session.firstMessage, 48) || "(empty)";
+		const when = item.session.modified.toISOString().slice(0, 16).replace("T", " ");
+		const state = item.missing ? "missing" : "present";
+		return `${index + 1}. ${item.branch} · ${item.worktreeName} [${state}] ${title} (${when})`;
+	}
+
+	interface DestinationChoice {
+		label: string;
+		path: string;
+	}
+
+	async function listResumeDestinations(gitRoot: string, currentCwd: string): Promise<DestinationChoice[]> {
+		const choices: DestinationChoice[] = [];
+		const add = (label: string, dir: string) => {
+			if (!directoryExists(dir)) return;
+			const resolved = canonicalPath(dir);
+			if (choices.some((choice) => choice.path === resolved)) return;
+			choices.push({ label, path: resolved });
+		};
+
+		add(`Current folder (${currentCwd})`, currentCwd);
+
+		const reg = await loadRegistry(gitRoot);
+		if (reg.known.length > 0) {
+			for (const known of reg.known) {
+				add(`${known.branch} (${known.path})`, known.path);
+			}
+		} else {
+			const gitWorktrees = await getGitWorktrees(gitRoot);
+			for (const wt of gitWorktrees) {
+				if (wt.bare) continue;
+				add(`${wt.branch ?? "(detached)"} (${wt.path})`, wt.path);
+			}
+		}
+		return choices;
+	}
+
+	const OTHER_FOLDER_CHOICE = "Other folder...";
+
+	async function handleSessionsCommand(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+		const customDir = sessionUsesCustomDir(ctx) ? ctx.sessionManager.getSessionDir() : undefined;
+		let picked: WorktreeSessionRow | null = null;
+
+		if (ctx.mode === "tui") {
+			picked = await ctx.ui.custom<WorktreeSessionRow | null>((tui, theme, keybindings, done) => {
+				const visible = Math.max(8, (tui.terminal?.rows ?? 24) - 8);
+				return new WorktreeSessionSelector({
+					theme,
+					keybindings,
+					requestRender: () => tui.requestRender(),
+					maxVisible: visible,
+					currentSessionFilePath: ctx.sessionManager.getSessionFile() ?? undefined,
+					loadCurrent: (signal) => loadCurrentFolderRows(ctx.cwd, gitRoot, ctx.sessionManager.getSessionDir(), signal),
+					loadWorktrees: (signal) => listWorktreeSessions(gitRoot, signal, customDir),
+					onSelect: (row) => done(row),
+					onCancel: () => done(null),
+					renameSession: async (sessionPath, nextName) => {
+						await renameSessionFile(sessionPath, nextName);
+					},
+				});
+			});
+		} else {
+			ctx.ui.notify("Loading worktree sessions...", "info");
+			const sessions = await listWorktreeSessions(gitRoot, undefined, customDir);
+			if (sessions.length === 0) {
+				ctx.ui.notify("No sessions found for recorded worktrees.", "info");
+				return;
+			}
+			const labels = sessions.map((session, index) => formatSessionChoice(session, index));
+			const selected = await ctx.ui.select("Worktree sessions", labels);
+			if (!selected) return;
+			picked = sessions[labels.indexOf(selected)] ?? null;
+		}
+		if (!picked) return;
+
+		const destinations = await listResumeDestinations(gitRoot, ctx.cwd);
+		const destinationLabels = [...destinations.map((choice) => choice.label), OTHER_FOLDER_CHOICE];
+		const destinationChoice = await selectSearchableItem(ctx, `Resume "${picked.branch}" in:`,
+			destinationLabels.map((label) => ({ value: label, label })));
+		if (!destinationChoice) return;
+
+		let destination = destinations.find((choice) => choice.label === destinationChoice)?.path;
+		if (destinationChoice === OTHER_FOLDER_CHOICE) {
+			const entered = await ctx.ui.input("Folder to resume in:", ctx.cwd);
+			if (!entered?.trim()) return;
+			destination = resolveUserPath(entered, ctx.cwd);
+			if (!directoryExists(destination)) {
+				ctx.ui.notify(`Not a directory: ${destination}`, "error");
+				return;
+			}
+		}
+		if (!destination) return;
+
+		try {
+			let sessionFile = picked.session.path;
+			let resumedInPlace = false;
+			if (sameDirectory(picked.session.cwd, destination)) {
+				resumedInPlace = true;
+			} else {
+				const forked = SessionManager.forkFrom(picked.session.path, destination);
+				const forkedFile = forked.getSessionFile();
+				if (!forkedFile) {
+					ctx.ui.notify("Fork did not produce a session file.", "error");
+					return;
+				}
+				sessionFile = forkedFile;
+			}
+
+			const result = await ctx.switchSession(sessionFile, {
+				withSession: async (next) => {
+					const how = resumedInPlace ? "Resumed" : "Forked and resumed";
+					next.ui.notify(`${how} in ${destination}`, "info");
 				},
 			});
-		});
-	} else {
-		ctx.ui.notify("Loading worktree sessions...", "info");
-		const sessions = await listWorktreeSessions(gitRoot, undefined, customDir);
-		if (sessions.length === 0) {
-			ctx.ui.notify("No sessions found for recorded worktrees.", "info");
-			return;
-		}
-		const labels = sessions.map((session, index) => formatSessionChoice(session, index));
-		const selected = await ctx.ui.select("Worktree sessions", labels);
-		if (!selected) return;
-		picked = sessions[labels.indexOf(selected)] ?? null;
-	}
-	if (!picked) return;
-
-	const destinations = await listResumeDestinations(gitRoot, ctx.cwd);
-	const destinationLabels = [...destinations.map((choice) => choice.label), OTHER_FOLDER_CHOICE];
-	const destinationChoice = await selectSearchableItem(ctx, `Resume "${picked.branch}" in:`,
-		destinationLabels.map((label) => ({ value: label, label })));
-	if (!destinationChoice) return;
-
-	let destination = destinations.find((choice) => choice.label === destinationChoice)?.path;
-	if (destinationChoice === OTHER_FOLDER_CHOICE) {
-		const entered = await ctx.ui.input("Folder to resume in:", ctx.cwd);
-		if (!entered?.trim()) return;
-		destination = resolveUserPath(entered, ctx.cwd);
-		if (!directoryExists(destination)) {
-			ctx.ui.notify(`Not a directory: ${destination}`, "error");
-			return;
-		}
-	}
-	if (!destination) return;
-
-	try {
-		let sessionFile = picked.session.path;
-		let resumedInPlace = false;
-		if (sameDirectory(picked.session.cwd, destination)) {
-			resumedInPlace = true;
-		} else {
-			const forked = SessionManager.forkFrom(picked.session.path, destination);
-			const forkedFile = forked.getSessionFile();
-			if (!forkedFile) {
-				ctx.ui.notify("Fork did not produce a session file.", "error");
-				return;
+			if (result.cancelled) {
+				ctx.ui.notify("Session switch cancelled.", "info");
 			}
-			sessionFile = forkedFile;
+		} catch (err: any) {
+			ctx.ui.notify(`Failed to resume session: ${err?.message || String(err)}`, "error");
 		}
-
-		const result = await ctx.switchSession(sessionFile, {
-			withSession: async (next) => {
-				const how = resumedInPlace ? "Resumed" : "Forked and resumed";
-				next.ui.notify(`${how} in ${destination}`, "info");
-			},
-		});
-		if (result.cancelled) {
-			ctx.ui.notify("Session switch cancelled.", "info");
-		}
-	} catch (err: any) {
-		ctx.ui.notify(`Failed to resume session: ${err?.message || String(err)}`, "error");
 	}
-}
 
-function sessionUsesCustomDir(ctx: ExtensionCommandContext): boolean {
-	const manager = ctx.sessionManager as { usesDefaultSessionDir?: () => boolean };
-	return manager.usesDefaultSessionDir?.() === false;
-}
+	function sessionUsesCustomDir(ctx: ExtensionCommandContext): boolean {
+		const manager = ctx.sessionManager as { usesDefaultSessionDir?: () => boolean };
+		return manager.usesDefaultSessionDir?.() === false;
+	}
 
-/**
- * Same picker `/resume` uses: current folder, with Tab for every session.
- * Used when this directory is not a git repository.
- */
-async function handleFolderSessionsCommand(ctx: ExtensionCommandContext): Promise<void> {
-	const currentFile = ctx.sessionManager.getSessionFile() ?? undefined;
-	const sessionDir = ctx.sessionManager.getSessionDir();
-	const customDir = sessionUsesCustomDir(ctx);
+	/**
+	 * Same picker `/resume` uses: current folder, with Tab for every session.
+	 * Used when this directory is not a git repository.
+	 */
+	async function handleFolderSessionsCommand(ctx: ExtensionCommandContext): Promise<void> {
+		const currentFile = ctx.sessionManager.getSessionFile() ?? undefined;
+		const sessionDir = ctx.sessionManager.getSessionDir();
+		const customDir = sessionUsesCustomDir(ctx);
 
-	const selectedPath = await ctx.ui.custom<string | null>((tui, _theme, keybindings, done) => {
-		return new SessionSelectorComponent(
-			(onProgress, signal) => SessionManager.list(ctx.cwd, sessionDir, onProgress, signal),
-			(onProgress, signal) =>
-				customDir
-					? SessionManager.listAll(sessionDir, onProgress, signal)
-					: SessionManager.listAll(onProgress, signal),
-			(sessionPath) => done(sessionPath),
-			() => done(null),
-			() => done(null),
-			() => tui.requestRender(),
-			{
-				showRenameHint: true,
-				keybindings,
-				renameSession: async (sessionFilePath, nextName) => {
-					const next = (nextName ?? "").trim();
-					if (!next) return;
-					const mgr = SessionManager.open(sessionFilePath);
-					mgr.appendSessionInfo(next);
+		const selectedPath = await ctx.ui.custom<string | null>((tui, _theme, keybindings, done) => {
+			return new SessionSelectorComponent(
+				(onProgress, signal) => SessionManager.list(ctx.cwd, sessionDir, onProgress, signal),
+				(onProgress, signal) =>
+					customDir
+						? SessionManager.listAll(sessionDir, onProgress, signal)
+						: SessionManager.listAll(onProgress, signal),
+				(sessionPath) => done(sessionPath),
+				() => done(null),
+				() => done(null),
+				() => tui.requestRender(),
+				{
+					showRenameHint: true,
+					keybindings,
+					renameSession: async (sessionFilePath, nextName) => {
+						const next = (nextName ?? "").trim();
+						if (!next) return;
+						const mgr = SessionManager.open(sessionFilePath);
+						mgr.appendSessionInfo(next);
+					},
 				},
-			},
-			currentFile,
-		);
-	});
-	if (!selectedPath) return;
-
-	try {
-		const result = await ctx.switchSession(selectedPath, {
-			withSession: async (next) => {
-				next.ui.notify("Resumed session", "info");
-			},
+				currentFile,
+			);
 		});
-		if (result.cancelled) {
-			ctx.ui.notify("Session switch cancelled.", "info");
+		if (!selectedPath) return;
+
+		try {
+			const result = await ctx.switchSession(selectedPath, {
+				withSession: async (next) => {
+					next.ui.notify("Resumed session", "info");
+				},
+			});
+			if (result.cancelled) {
+				ctx.ui.notify("Session switch cancelled.", "info");
+			}
+		} catch (err: any) {
+			ctx.ui.notify(`Failed to resume session: ${err?.message || String(err)}`, "error");
 		}
-	} catch (err: any) {
-		ctx.ui.notify(`Failed to resume session: ${err?.message || String(err)}`, "error");
 	}
-}
 
-// ---------------------------------------------------------------------------
-// Interactive UI Menus & Output Formatting
-// ---------------------------------------------------------------------------
+	// ---------------------------------------------------------------------------
+	// Interactive UI Menus & Output Formatting
+	// ---------------------------------------------------------------------------
 
-function formatWorktreeListText(statuses: FullWorktreeStatus[]): string {
-	if (statuses.length === 0) return "No worktrees found.";
+	function formatWorktreeListText(statuses: FullWorktreeStatus[]): string {
+		if (statuses.length === 0) return "No worktrees found.";
 
-	const lines: string[] = ["Git Worktrees:", ""];
-	for (const wt of statuses) {
-		const branchStr = wt.branch || "(detached)";
-		const badge = wt.isMain ? "[main]" : wt.isManaged ? "[managed]" : "[external]";
-		const tmuxBadge = wt.tmuxActive ? "⚡ tmux:active" : "";
+		const lines: string[] = ["Git Worktrees:", ""];
+		for (const wt of statuses) {
+			const branchStr = wt.branch || "(detached)";
+			const badge = wt.isMain ? "[main]" : wt.isManaged ? "[managed]" : "[external]";
+			const terminalBadge = wt.terminalActive ? `⚡ ${wt.terminalLabel}:active` : wt.tmuxActive ? "⚡ tmux:active" : "";
 
-		lines.push(`• ${branchStr} ${badge} ${tmuxBadge}`.trim());
-		lines.push(`  Path: ${wt.path}`);
-		if (wt.commit) {
-			lines.push(`  Commit: ${wt.commit.slice(0, 8)}`);
+			lines.push(`• ${branchStr} ${badge} ${terminalBadge}`.trim());
+			lines.push(`  Path: ${wt.path}`);
+			if (wt.commit) {
+				lines.push(`  Commit: ${wt.commit.slice(0, 8)}`);
+			}
+			lines.push("");
 		}
-		lines.push("");
-	}
-	return lines.join("\n");
-}
-
-function notifyNeedsGit(ctx: ExtensionCommandContext): void {
-	ctx.ui.notify("Current directory is not inside a git repository.", "error");
-}
-
-async function showInteractiveWorktreeMenu(
-	ctx: ExtensionCommandContext,
-	gitRoot: string | null,
-	pi: ExtensionAPI,
-	handlePrCommand: (args: string, ctx: ExtensionCommandContext, root: string) => Promise<void>,
-): Promise<void> {
-	const selected = await selectWorktreeCommand(ctx);
-	if (!selected) return;
-
-	if (selected === "sessions") {
-		if (gitRoot) await handleSessionsCommand(ctx, gitRoot);
-		else await handleFolderSessionsCommand(ctx);
-		return;
-	}
-	if (selected === "help") {
-		showHelp(ctx);
-		return;
-	}
-	if (!gitRoot) {
-		notifyNeedsGit(ctx);
-		return;
+		return lines.join("\n");
 	}
 
-	if (selected === "create") {
-		const branch = await ctx.ui.input("Enter new branch name for worktree:");
-		if (!branch || !branch.trim()) return;
-		await handleCreateCommand(branch.trim(), ctx, gitRoot);
-	} else if (selected === "list") {
-		await handleListCommand(ctx, gitRoot, pi, handlePrCommand);
-	} else if (selected === "switch") {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
-		if (nonMain.length === 0) {
-			ctx.ui.notify("No other worktrees available to switch to", "warning");
+	function notifyNeedsGit(ctx: ExtensionCommandContext): void {
+		ctx.ui.notify("Current directory is not inside a git repository.", "error");
+	}
+
+	async function showInteractiveWorktreeMenu(
+		ctx: ExtensionCommandContext,
+		gitRoot: string | null,
+		pi: ExtensionAPI,
+		handlePrCommand: (args: string, ctx: ExtensionCommandContext, root: string) => Promise<void>,
+	): Promise<void> {
+		const selected = await selectWorktreeCommand(ctx);
+		if (!selected) return;
+
+		if (selected === "sessions") {
+			if (gitRoot) await handleSessionsCommand(ctx, gitRoot);
+			else await handleFolderSessionsCommand(ctx);
 			return;
 		}
-		const branchChoice = await selectWorktree(ctx, "Select worktree to switch to:", nonMain);
-		if (branchChoice) {
-			await handleSwitchCommand(branchChoice, ctx, gitRoot);
-		}
-	} else if (selected === "rebase") {
-		await handleRebaseCommand("", ctx, gitRoot, pi);
-	} else if (selected === "tip") {
-		await handleRebaseCommand("", ctx, gitRoot, pi, "tip");
-	} else if (selected === "pr") {
-		await handlePrCommand("", ctx, gitRoot);
-	} else if (selected === "rename") {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
-		if (nonMain.length === 0) {
-			ctx.ui.notify("No worktrees available to rename", "warning");
+		if (selected === "help") {
+			showHelp(ctx);
 			return;
 		}
-		const oldBranch = await selectWorktree(ctx, "Select branch to rename:", nonMain);
-		if (!oldBranch) return;
-		const newBranch = await ctx.ui.input(`Enter new name for branch "${oldBranch}":`);
-		if (!newBranch || !newBranch.trim()) return;
-		await handleRenameCommand(`${oldBranch} ${newBranch.trim()}`, ctx, gitRoot);
-	} else if (selected === "remove") {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
-		if (nonMain.length === 0) {
-			ctx.ui.notify("No worktrees available to remove", "warning");
+		if (!gitRoot) {
+			notifyNeedsGit(ctx);
 			return;
 		}
-		const branchToRemove = await selectWorktree(ctx, "Select worktree to remove:", nonMain);
-		if (branchToRemove) {
-			await handleRemoveCommand(branchToRemove, ctx, gitRoot);
-		}
-	} else if (selected === "clean") {
-		await handleCleanCommand(ctx, gitRoot);
-	}
-}
 
-function showHelp(ctx: ExtensionContext): void {
-	const helpText = [
-		"🌿 Worktree Management Commands:",
-		"",
-		"  /worktree <branch>               Create worktree & run pi agent in tmux without prompt",
-		"  /worktree create <branch> [base] Create worktree from base branch & run pi in tmux",
-		"  /worktree list                   Interactive list: j/k navigate, / search, q close",
-		"                                   x remove, n rename, r rebase, t tip, p PR, Enter/w switch",
-		"                                   c create, l refresh, s sessions, Shift+C clean, ? help",
-		"                                   Configure worktree.list.* actions in agent keybindings.json",
-		"  /worktree                        Searchable menu: type to fuzzy-search commands, then Enter to select",
-		"  /worktree sessions               Resume a session from a recorded worktree, even if it was removed",
-		"                                   Tab: current folder / all worktrees. Search, sort, filter by branch or worktree",
-		"                                   Outside a git repo, opens the usual session list",
-		"  /worktree clean                  Clean up all managed worktrees and branches",
-		"  /worktree remove [branch]        Remove specific worktree and delete branch",
-		"  /worktree rename <old> <new>     Rename worktree branch",
-		"  /worktree switch [branch]        Switch/attach to worktree's tmux window/session",
-		"  /worktree rebase [branch]        Rebase local main/master onto the current/selected topic",
-		"  /worktree tip [branch]           Rebase the current/selected topic onto local main/master",
-		"                                   On main/master: select a topic. Pi resolves conflicts in either direction",
-		"  /worktree pr [branch]            Select a topic worktree, rebase onto remote main/master, create PR",
-		"                                   Use /skill:pr for the body; repair failures until CI is verified green",
-		"  /worktree help                   Show this help message",
-		"",
-		"💡 Worktree pickers: type to fuzzy-search branches or paths; ↑/↓ select, Enter confirms, Escape cancels",
-		"💡 Default aliases: /wt = /worktree; /wt l = /worktree list",
-		"💡 Also: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
-		"💡 Configure commandAliases and subcommandAliases in your agent directory's worktree.json; /reload applies changes",
-	].join("\n");
-
-	ctx.ui.notify(helpText, "info");
-}
-
-// ---------------------------------------------------------------------------
-// Command Handlers
-// ---------------------------------------------------------------------------
-
-async function handleRebaseCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string, pi: ExtensionAPI, command: "rebase" | "tip" = "rebase"): Promise<void> {
-	const handler = command === "tip" ? handleWorktreeTip : handleWorktreeRebase;
-	await handler(args, ctx, gitRoot, {
-		git: (gitArgs, cwd) => exec("git", gitArgs, cwd),
-		getWorktrees: getGitWorktrees,
-		sendUserMessage: (prompt) => pi.sendUserMessage(prompt, { deliverAs: "followUp" }),
-	});
-}
-
-async function handleCreateCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	const parts = args.trim().split(/\s+/);
-	const branch = parts[0];
-	const baseBranch = parts[1];
-
-	if (!branch) {
-		ctx.ui.notify("Usage: /worktree <branch-name> [base-branch]", "error");
-		return;
-	}
-
-	ctx.ui.notify(`Creating worktree for "${branch}" and launching pi in tmux...`, "info");
-
-	const res = await createWorktreeAndSpawnPi(gitRoot, { branch, baseBranch, invokedFrom: ctx.cwd });
-	if (!res.success) {
-		ctx.ui.notify(`Failed to create worktree: ${res.error}`, "error");
-		return;
-	}
-
-	let msg = `✓ Created worktree "${branch}"\n  Path: ${res.worktreePath}\n`;
-	if (res.isInsideTmux) {
-		const winHint = res.windowIndex !== undefined ? ` (Window ${res.windowIndex})` : "";
-		msg += `  Tmux: New window opened${winHint}.\n  Switch with: tmux select-window -t ${res.tmuxTarget || `wt:${sanitizeBranchForPath(branch)}`}`;
-	} else {
-		msg += `  Tmux: Session "${res.tmuxTarget}" created.\n  Attach with: tmux attach -t ${res.tmuxTarget}`;
-	}
-
-	ctx.ui.notify(msg, "info");
-}
-
-async function handleListCommand(
-	ctx: ExtensionCommandContext,
-	gitRoot: string,
-	pi: ExtensionAPI,
-	handlePrCommand: (args: string, ctx: ExtensionCommandContext, root: string) => Promise<void>,
-): Promise<void> {
-	if (ctx.mode !== "tui") {
-		ctx.ui.notify(formatWorktreeListText(await getAllWorktreeStatuses(gitRoot)), "info");
-		return;
-	}
-	await browseWorktrees(ctx, () => getAllWorktreeStatuses(gitRoot), async ({ command, worktree }) => {
-		const branch = worktree?.branch ?? "";
-		switch (command) {
-			case "create": {
-				const name = await ctx.ui.input("Enter new branch name for worktree:");
-				if (name?.trim()) await handleCreateCommand(name.trim(), ctx, gitRoot);
+		if (selected === "create") {
+			const branch = await ctx.ui.input("Enter new branch name for worktree:");
+			if (!branch || !branch.trim()) return;
+			await handleCreateCommand(branch.trim(), ctx, gitRoot);
+		} else if (selected === "list") {
+			await handleListCommand(ctx, gitRoot, pi, handlePrCommand);
+		} else if (selected === "switch") {
+			const statuses = await getAllWorktreeStatuses(gitRoot);
+			const nonMain = statuses.filter((s) => !s.isMain && s.branch);
+			if (nonMain.length === 0) {
+				ctx.ui.notify("No other worktrees available to switch to", "warning");
 				return;
 			}
-			case "sessions": await handleSessionsCommand(ctx, gitRoot); return;
-			case "switch": await handleSwitchCommand(branch, ctx, gitRoot); return;
-			case "rebase": await handleRebaseCommand(branch, ctx, gitRoot, pi); return;
-			case "tip": await handleRebaseCommand(branch, ctx, gitRoot, pi, "tip"); return;
-			case "pr": await handlePrCommand(branch, ctx, gitRoot); return;
-			case "rename": await handleRenameCommand(branch, ctx, gitRoot); return;
-			case "remove": await handleRemoveCommand(branch, ctx, gitRoot); return;
-			case "clean": await handleCleanCommand(ctx, gitRoot); return;
-			case "help": showHelp(ctx); return;
-			case "list": return;
-		}
-	});
-}
-
-async function handleCleanCommand(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	const reg = await loadRegistry(gitRoot);
-	const managedCount = Object.keys(reg.worktrees).length;
-
-	if (managedCount === 0) {
-		ctx.ui.notify("No managed worktrees to clean up.", "info");
-		return;
-	}
-
-	const listPreview = Object.values(reg.worktrees)
-		.map((w) => `  • ${w.branch} (${w.path})`)
-		.join("\n");
-
-	const ok = await ctx.ui.confirm(
-		"Clean up worktrees & branches?",
-		`This will permanently remove ${managedCount} managed worktree(s) and delete their git branches:\n\n${listPreview}`,
-	);
-
-	if (!ok) {
-		ctx.ui.notify("Cleanup cancelled.", "info");
-		return;
-	}
-
-	ctx.ui.notify("Cleaning up worktrees...", "info");
-	const result = await cleanManagedWorktrees(gitRoot);
-
-	const summaryLines: string[] = ["Cleanup Complete:"];
-	for (const c of result.cleaned) {
-		summaryLines.push(`  ✓ Removed ${c.branch}`);
-	}
-	for (const f of result.failed) {
-		summaryLines.push(`  ✗ ${f.branch}: ${f.error}`);
-	}
-
-	ctx.ui.notify(summaryLines.join("\n"), result.failed.length > 0 ? "warning" : "info");
-}
-
-async function handleRemoveCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	let branch = args.trim();
-
-	if (!branch) {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
-		if (nonMain.length === 0) {
-			ctx.ui.notify("No worktrees available to remove.", "warning");
-			return;
-		}
-		const chosen = await selectWorktree(ctx, "Select worktree to remove:", nonMain);
-		if (!chosen) return;
-		branch = chosen;
-	}
-
-	const ok = await ctx.ui.confirm(
-		`Remove worktree "${branch}"?`,
-		`This will delete the worktree directory and branch "${branch}".`,
-	);
-
-	if (!ok) {
-		ctx.ui.notify("Removal cancelled.", "info");
-		return;
-	}
-
-	const res = await removeSingleWorktree(gitRoot, branch, true);
-	if (!res.success) {
-		ctx.ui.notify(`Failed to remove worktree: ${res.error}`, "error");
-		return;
-	}
-
-	ctx.ui.notify(`✓ Successfully removed worktree and branch "${branch}".`, "info");
-}
-
-async function handleRenameCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	const parts = args.trim().split(/\s+/);
-	let oldBranch = parts[0];
-	let newBranch = parts[1];
-
-	if (!oldBranch || !newBranch) {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
-		if (nonMain.length === 0) {
-			ctx.ui.notify("No worktrees available to rename.", "warning");
-			return;
-		}
-
-		if (!oldBranch) {
-			const chosen = await selectWorktree(ctx, "Select branch to rename:", nonMain);
-			if (!chosen) return;
-			oldBranch = chosen;
-		}
-
-		if (!newBranch) {
-			const entered = await ctx.ui.input(`Enter new branch name for "${oldBranch}":`);
-			if (!entered || !entered.trim()) return;
-			newBranch = entered.trim();
-		}
-	}
-
-	const res = await renameWorktreeBranch(gitRoot, oldBranch, newBranch);
-	if (!res.success) {
-		ctx.ui.notify(`Failed to rename branch: ${res.error}`, "error");
-		return;
-	}
-
-	ctx.ui.notify(`✓ Renamed branch "${oldBranch}" → "${newBranch}".`, "info");
-}
-
-async function handleSwitchCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
-	let branch = args.trim();
-
-	if (!branch) {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const nonMain = statuses.filter((s) => !s.isMain && s.branch);
-		if (nonMain.length === 0) {
-			ctx.ui.notify("No worktrees available.", "warning");
-			return;
-		}
-		const chosen = await selectWorktree(ctx, "Select worktree to switch to:", nonMain);
-		if (!chosen) return;
-		branch = chosen;
-	}
-
-	const statuses = await getAllWorktreeStatuses(gitRoot);
-	const target = statuses.find((s) => s.branch === branch);
-
-	if (!target) {
-		ctx.ui.notify(`Worktree for branch "${branch}" not found.`, "error");
-		return;
-	}
-
-	if (isInsideTmux()) {
-		const windowTarget = target.tmuxTarget || `wt:${sanitizeBranchForPath(branch)}`;
-		const swRes = await switchToTmuxTarget(windowTarget, target.path);
-		if (swRes.success) {
-			ctx.ui.notify(`Switched to tmux window for "${branch}".`, "info");
-		} else {
-			// If no verifiable window exists, spawn one
-			const spawnRes = await spawnPiInTmux(target.path, branch);
-			if (spawnRes.success && spawnRes.tmuxTarget) {
-				await switchToTmuxTarget(spawnRes.tmuxTarget, target.path);
-				ctx.ui.notify(`Launched pi in tmux window and switched to "${branch}".`, "info");
-			} else {
-				ctx.ui.notify(`Failed to switch window: ${swRes.error || spawnRes.error}`, "error");
+			const branchChoice = await selectWorktree(ctx, "Select worktree to switch to:", nonMain);
+			if (branchChoice) {
+				await handleSwitchCommand(branchChoice, ctx, gitRoot);
 			}
+		} else if (selected === "rebase") {
+			await handleRebaseCommand("", ctx, gitRoot, pi);
+		} else if (selected === "tip") {
+			await handleRebaseCommand("", ctx, gitRoot, pi, "tip");
+		} else if (selected === "pr") {
+			await handlePrCommand("", ctx, gitRoot);
+		} else if (selected === "rename") {
+			const statuses = await getAllWorktreeStatuses(gitRoot);
+			const nonMain = statuses.filter((s) => !s.isMain && s.branch);
+			if (nonMain.length === 0) {
+				ctx.ui.notify("No worktrees available to rename", "warning");
+				return;
+			}
+			const oldBranch = await selectWorktree(ctx, "Select branch to rename:", nonMain);
+			if (!oldBranch) return;
+			const newBranch = await ctx.ui.input(`Enter new name for branch "${oldBranch}":`);
+			if (!newBranch || !newBranch.trim()) return;
+			await handleRenameCommand(`${oldBranch} ${newBranch.trim()}`, ctx, gitRoot);
+		} else if (selected === "remove") {
+			const statuses = await getAllWorktreeStatuses(gitRoot);
+			const nonMain = statuses.filter((s) => !s.isMain && s.branch);
+			if (nonMain.length === 0) {
+				ctx.ui.notify("No worktrees available to remove", "warning");
+				return;
+			}
+			const branchToRemove = await selectWorktree(ctx, "Select worktree to remove:", nonMain);
+			if (branchToRemove) {
+				await handleRemoveCommand(branchToRemove, ctx, gitRoot);
+			}
+		} else if (selected === "clean") {
+			await handleCleanCommand(ctx, gitRoot);
 		}
-	} else {
-		const sessionName = target.tmuxTarget || `pi-wt-${sanitizeBranchForPath(branch)}`;
-		ctx.ui.notify(`Run this in your terminal to attach:\n  tmux attach -t ${sessionName}`, "info");
 	}
-}
 
-// ---------------------------------------------------------------------------
-// Argument Autocompletion
-// ---------------------------------------------------------------------------
+	function showHelp(ctx: ExtensionContext): void {
+		const helpText = [
+			"🌿 Worktree Management Commands:",
+			"",
+			`  /worktree <branch>               Create worktree & run pi agent in ${terminal?.label ?? "tmux"} without prompt`,
+			`  /worktree create <branch> [base] Create worktree from base branch & run pi in ${terminal?.label ?? "tmux"}`,
+			"  /worktree list                   Interactive list: j/k navigate, / search, q close",
+			"                                   x remove, n rename, r rebase, t tip, p PR, Enter/w switch",
+			"                                   c create, l refresh, s sessions, Shift+C clean, ? help",
+			"                                   Configure worktree.list.* actions in agent keybindings.json",
+			"  /worktree                        Searchable menu: type to fuzzy-search commands, then Enter to select",
+			"  /worktree sessions               Resume a session from a recorded worktree, even if it was removed",
+			"                                   Tab: current folder / all worktrees. Search, sort, filter by branch or worktree",
+			"                                   Outside a git repo, opens the usual session list",
+			"  /worktree clean                  Clean up all managed worktrees and branches",
+			"  /worktree remove [branch]        Remove specific worktree and delete branch",
+			"  /worktree rename <old> <new>     Rename worktree branch",
+			`  /worktree switch [branch]        Switch to worktree's ${terminal?.label ?? "tmux"} window`,
+			"  /worktree rebase [branch]        Rebase local main/master onto the current/selected topic",
+			"  /worktree tip [branch]           Rebase the current/selected topic onto local main/master",
+			"                                   On main/master: select a topic. Pi resolves conflicts in either direction",
+			"  /worktree pr [branch]            Select a topic worktree, rebase onto remote main/master, create PR",
+			"                                   Use /skill:pr for the body; repair failures until CI is verified green",
+			"  /worktree help                   Show this help message",
+			"",
+			"💡 Worktree pickers: type to fuzzy-search branches or paths; ↑/↓ select, Enter confirms, Escape cancels",
+			"💡 Default aliases: /wt = /worktree; /wt l = /worktree list",
+			"💡 Also: /worktrees, /worktree-clean, /worktree-remove, /worktree-rename",
+			"💡 Configure commandAliases and subcommandAliases in your agent directory's worktree.json; /reload applies changes",
+		].join("\n");
 
-async function getWorktreeArgumentCompletions(
-	prefix: string,
-	gitRoot: string | null,
-	aliases: SubcommandAliases,
-): Promise<AutocompleteItem[] | null> {
-	const subcommands = [
-		{ value: "create", label: "create <branch>", description: "Create worktree & run pi" },
-		{ value: "list", label: "list", description: "List all worktrees" },
-		{ value: "sessions", label: "sessions", description: "Browse worktree sessions and resume one" },
-		{ value: "clean", label: "clean", description: "Clean up managed worktrees & branches" },
-		{ value: "remove", label: "remove <branch>", description: "Remove worktree & delete branch" },
-		{ value: "rename", label: "rename <old> <new>", description: "Rename worktree branch" },
-		{ value: "switch", label: "switch <branch>", description: "Switch/attach to worktree" },
-		{ value: "rebase", label: "rebase [branch]", description: "Rebase local main/master onto topic worktree; Pi resolves conflicts" },
-		{ value: "tip", label: "tip [branch]", description: "Rebase topic worktree onto local main/master; Pi resolves conflicts" },
-		{ value: "pr", label: "pr [branch]", description: "Remote-base rebase, create PR with /skill:pr, and verify green CI" },
-		{ value: "help", label: "help", description: "Show help" },
-	];
+		ctx.ui.notify(helpText, "info");
+	}
 
-	for (const [alias, target] of Object.entries(aliases)) {
-		const canonical = subcommands.find((command) => command.value === target);
-		if (canonical) subcommands.push({
-			value: alias,
-			label: alias + canonical.label.slice(target.length),
-			description: `Alias for ${target}: ${canonical.description}`,
+	// ---------------------------------------------------------------------------
+	// Command Handlers
+	// ---------------------------------------------------------------------------
+
+	async function handleRebaseCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string, pi: ExtensionAPI, command: "rebase" | "tip" = "rebase"): Promise<void> {
+		const handler = command === "tip" ? handleWorktreeTip : handleWorktreeRebase;
+		await handler(args, ctx, gitRoot, {
+			git: (gitArgs, cwd) => exec("git", gitArgs, cwd),
+			getWorktrees: getGitWorktrees,
+			sendUserMessage: (prompt) => pi.sendUserMessage(prompt, { deliverAs: "followUp" }),
 		});
 	}
 
-	const trimmed = prefix.trimStart();
-	const parts = trimmed.split(/\s+/);
+	async function handleCreateCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+		const parts = args.trim().split(/\s+/);
+		const branch = parts[0];
+		const baseBranch = parts[1];
 
-	if (parts.length <= 1) {
-		const matchPrefix = parts[0] || "";
-		const matches = subcommands.filter((s) => s.value.startsWith(matchPrefix));
+		if (!branch) {
+			ctx.ui.notify("Usage: /worktree <branch-name> [base-branch]", "error");
+			return;
+		}
 
-		// Also suggest existing branches if git root is available
-		if (gitRoot) {
+		ctx.ui.notify(`Creating worktree for "${branch}" and launching pi in ${terminal?.label ?? "tmux"}...`, "info");
+
+		const res = await createWorktreeAndSpawnPi(gitRoot, { branch, baseBranch, invokedFrom: ctx.cwd });
+		if (!res.success) {
+			ctx.ui.notify(`Failed to create worktree: ${res.error}`, "error");
+			return;
+		}
+
+		let msg = `✓ Created worktree "${branch}"\n  Path: ${res.worktreePath}\n`;
+		if (terminal && res.terminalTarget) {
+			msg += terminal.describe(res.terminalTarget);
+		} else if (res.isInsideTmux) {
+			const winHint = res.windowIndex !== undefined ? ` (Window ${res.windowIndex})` : "";
+			msg += `  Tmux: New window opened${winHint}.\n  Switch with: tmux select-window -t ${res.tmuxTarget || `wt:${sanitizeBranchForPath(branch)}`}`;
+		} else {
+			msg += `  Tmux: Session "${res.tmuxTarget}" created.\n  Attach with: tmux attach -t ${res.tmuxTarget}`;
+		}
+
+		ctx.ui.notify(msg, "info");
+	}
+
+	async function handleListCommand(
+		ctx: ExtensionCommandContext,
+		gitRoot: string,
+		pi: ExtensionAPI,
+		handlePrCommand: (args: string, ctx: ExtensionCommandContext, root: string) => Promise<void>,
+	): Promise<void> {
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify(formatWorktreeListText(await getAllWorktreeStatuses(gitRoot)), "info");
+			return;
+		}
+		await browseWorktrees(ctx, () => getAllWorktreeStatuses(gitRoot), async ({ command, worktree }) => {
+			const branch = worktree?.branch ?? "";
+			switch (command) {
+				case "create": {
+					const name = await ctx.ui.input("Enter new branch name for worktree:");
+					if (name?.trim()) await handleCreateCommand(name.trim(), ctx, gitRoot);
+					return;
+				}
+				case "sessions": await handleSessionsCommand(ctx, gitRoot); return;
+				case "switch": await handleSwitchCommand(branch, ctx, gitRoot); return;
+				case "rebase": await handleRebaseCommand(branch, ctx, gitRoot, pi); return;
+				case "tip": await handleRebaseCommand(branch, ctx, gitRoot, pi, "tip"); return;
+				case "pr": await handlePrCommand(branch, ctx, gitRoot); return;
+				case "rename": await handleRenameCommand(branch, ctx, gitRoot); return;
+				case "remove": await handleRemoveCommand(branch, ctx, gitRoot); return;
+				case "clean": await handleCleanCommand(ctx, gitRoot); return;
+				case "help": showHelp(ctx); return;
+				case "list": return;
+			}
+		});
+	}
+
+	async function handleCleanCommand(ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+		const reg = await loadRegistry(gitRoot);
+		const managedCount = Object.keys(reg.worktrees).length;
+
+		if (managedCount === 0) {
+			ctx.ui.notify("No managed worktrees to clean up.", "info");
+			return;
+		}
+
+		const listPreview = Object.values(reg.worktrees)
+			.map((w) => `  • ${w.branch} (${w.path})`)
+			.join("\n");
+
+		const ok = await ctx.ui.confirm(
+			"Clean up worktrees & branches?",
+			`This will permanently remove ${managedCount} managed worktree(s) and delete their git branches:\n\n${listPreview}`,
+		);
+
+		if (!ok) {
+			ctx.ui.notify("Cleanup cancelled.", "info");
+			return;
+		}
+
+		ctx.ui.notify("Cleaning up worktrees...", "info");
+		const result = await cleanManagedWorktrees(gitRoot);
+
+		const summaryLines: string[] = ["Cleanup Complete:"];
+		for (const c of result.cleaned) {
+			summaryLines.push(`  ✓ Removed ${c.branch}`);
+		}
+		for (const f of result.failed) {
+			summaryLines.push(`  ✗ ${f.branch}: ${f.error}`);
+		}
+
+		ctx.ui.notify(summaryLines.join("\n"), result.failed.length > 0 ? "warning" : "info");
+	}
+
+	async function handleRemoveCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+		let branch = args.trim();
+
+		if (!branch) {
+			const statuses = await getAllWorktreeStatuses(gitRoot);
+			const nonMain = statuses.filter((s) => !s.isMain && s.branch);
+			if (nonMain.length === 0) {
+				ctx.ui.notify("No worktrees available to remove.", "warning");
+				return;
+			}
+			const chosen = await selectWorktree(ctx, "Select worktree to remove:", nonMain);
+			if (!chosen) return;
+			branch = chosen;
+		}
+
+		const ok = await ctx.ui.confirm(
+			`Remove worktree "${branch}"?`,
+			`This will delete the worktree directory and branch "${branch}".`,
+		);
+
+		if (!ok) {
+			ctx.ui.notify("Removal cancelled.", "info");
+			return;
+		}
+
+		const res = await removeSingleWorktree(gitRoot, branch, true);
+		if (!res.success) {
+			ctx.ui.notify(`Failed to remove worktree: ${res.error}`, "error");
+			return;
+		}
+
+		ctx.ui.notify(`✓ Successfully removed worktree and branch "${branch}".`, "info");
+	}
+
+	async function handleRenameCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+		const parts = args.trim().split(/\s+/);
+		let oldBranch = parts[0];
+		let newBranch = parts[1];
+
+		if (!oldBranch || !newBranch) {
+			const statuses = await getAllWorktreeStatuses(gitRoot);
+			const nonMain = statuses.filter((s) => !s.isMain && s.branch);
+			if (nonMain.length === 0) {
+				ctx.ui.notify("No worktrees available to rename.", "warning");
+				return;
+			}
+
+			if (!oldBranch) {
+				const chosen = await selectWorktree(ctx, "Select branch to rename:", nonMain);
+				if (!chosen) return;
+				oldBranch = chosen;
+			}
+
+			if (!newBranch) {
+				const entered = await ctx.ui.input(`Enter new branch name for "${oldBranch}":`);
+				if (!entered || !entered.trim()) return;
+				newBranch = entered.trim();
+			}
+		}
+
+		const res = await renameWorktreeBranch(gitRoot, oldBranch, newBranch);
+		if (!res.success) {
+			ctx.ui.notify(`Failed to rename branch: ${res.error}`, "error");
+			return;
+		}
+
+		ctx.ui.notify(`✓ Renamed branch "${oldBranch}" → "${newBranch}".`, "info");
+	}
+
+	async function handleSwitchCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+		let branch = args.trim();
+
+		if (!branch) {
+			const statuses = await getAllWorktreeStatuses(gitRoot);
+			const nonMain = statuses.filter((s) => !s.isMain && s.branch);
+			if (nonMain.length === 0) {
+				ctx.ui.notify("No worktrees available.", "warning");
+				return;
+			}
+			const chosen = await selectWorktree(ctx, "Select worktree to switch to:", nonMain);
+			if (!chosen) return;
+			branch = chosen;
+		}
+
+		const statuses = await getAllWorktreeStatuses(gitRoot);
+		const target = statuses.find((s) => s.branch === branch);
+
+		if (!target) {
+			ctx.ui.notify(`Worktree for branch "${branch}" not found.`, "error");
+			return;
+		}
+
+		if (terminal) {
+			try {
+				const resolved = target.terminalTarget ?? await terminal.spawn(target.path, branch);
+				// Switching an external or primary checkout must not opt it into destructive clean.
+				if (target.managedRecord) {
+					target.managedRecord.terminal = resolved;
+					await registerManagedWorktree(gitRoot, target.managedRecord);
+				}
+				ctx.ui.notify(await terminal.switch(resolved), "info");
+			} catch (error) {
+				ctx.ui.notify(`Failed to switch ${terminal.label} tab: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+			return;
+		}
+
+		if (isInsideTmux()) {
+			const windowTarget = target.tmuxTarget || `wt:${sanitizeBranchForPath(branch)}`;
+			const swRes = await switchToTmuxTarget(windowTarget, target.path);
+			if (swRes.success) {
+				ctx.ui.notify(`Switched to tmux window for "${branch}".`, "info");
+			} else {
+				// If no verifiable window exists, spawn one
+				const spawnRes = await spawnPiInTmux(target.path, branch);
+				if (spawnRes.success && spawnRes.tmuxTarget) {
+					await switchToTmuxTarget(spawnRes.tmuxTarget, target.path);
+					ctx.ui.notify(`Launched pi in tmux window and switched to "${branch}".`, "info");
+				} else {
+					ctx.ui.notify(`Failed to switch window: ${swRes.error || spawnRes.error}`, "error");
+				}
+			}
+		} else {
+			const sessionName = target.tmuxTarget || `pi-wt-${sanitizeBranchForPath(branch)}`;
+			ctx.ui.notify(`Run this in your terminal to attach:\n  tmux attach -t ${sessionName}`, "info");
+		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Argument Autocompletion
+	// ---------------------------------------------------------------------------
+
+	async function getWorktreeArgumentCompletions(
+		prefix: string,
+		gitRoot: string | null,
+		aliases: SubcommandAliases,
+	): Promise<AutocompleteItem[] | null> {
+		const subcommands = [
+			{ value: "create", label: "create <branch>", description: "Create worktree & run pi" },
+			{ value: "list", label: "list", description: "List all worktrees" },
+			{ value: "sessions", label: "sessions", description: "Browse worktree sessions and resume one" },
+			{ value: "clean", label: "clean", description: "Clean up managed worktrees & branches" },
+			{ value: "remove", label: "remove <branch>", description: "Remove worktree & delete branch" },
+			{ value: "rename", label: "rename <old> <new>", description: "Rename worktree branch" },
+			{ value: "switch", label: "switch <branch>", description: "Switch/attach to worktree" },
+			{ value: "rebase", label: "rebase [branch]", description: "Rebase local main/master onto topic worktree; Pi resolves conflicts" },
+			{ value: "tip", label: "tip [branch]", description: "Rebase topic worktree onto local main/master; Pi resolves conflicts" },
+			{ value: "pr", label: "pr [branch]", description: "Remote-base rebase, create PR with /skill:pr, and verify green CI" },
+			{ value: "help", label: "help", description: "Show help" },
+		];
+
+		for (const [alias, target] of Object.entries(aliases)) {
+			const canonical = subcommands.find((command) => command.value === target);
+			if (canonical) subcommands.push({
+				value: alias,
+				label: alias + canonical.label.slice(target.length),
+				description: `Alias for ${target}: ${canonical.description}`,
+			});
+		}
+
+		const trimmed = prefix.trimStart();
+		const parts = trimmed.split(/\s+/);
+
+		if (parts.length <= 1) {
+			const matchPrefix = parts[0] || "";
+			const matches = subcommands.filter((s) => s.value.startsWith(matchPrefix));
+
+			// Also suggest existing branches if git root is available
+			if (gitRoot) {
+				const statuses = await getAllWorktreeStatuses(gitRoot);
+				const branchMatches = statuses
+					.filter((s) => !s.isMain && s.branch && s.branch.startsWith(matchPrefix))
+					.map((s) => ({
+						value: s.branch!,
+						label: s.branch!,
+						description: `Worktree at ${s.path}`,
+					}));
+				matches.push(...branchMatches);
+			}
+
+			return matches.length > 0 ? matches : null;
+		}
+
+		// Subcommand argument completion (e.g. /worktree remove <tab>, /worktree switch <tab>)
+		const sub = resolveWorktreeSubcommand(parts[0], aliases);
+		const subArg = parts[1] || "";
+
+		if (["remove", "switch", "rename", "rebase", "tip", "pr"].includes(sub) && gitRoot) {
 			const statuses = await getAllWorktreeStatuses(gitRoot);
 			const branchMatches = statuses
-				.filter((s) => !s.isMain && s.branch && s.branch.startsWith(matchPrefix))
+				.filter((s) => (["rebase", "tip", "pr"].includes(sub) ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
 				.map((s) => ({
-					value: s.branch!,
+					value: `${parts[0]} ${s.branch!}`,
 					label: s.branch!,
-					description: `Worktree at ${s.path}`,
+					description: s.path,
 				}));
-			matches.push(...branchMatches);
+			return branchMatches.length > 0 ? branchMatches : null;
 		}
 
-		return matches.length > 0 ? matches : null;
+		return null;
 	}
 
-	// Subcommand argument completion (e.g. /worktree remove <tab>, /worktree switch <tab>)
-	const sub = resolveWorktreeSubcommand(parts[0], aliases);
-	const subArg = parts[1] || "";
+	// ---------------------------------------------------------------------------
+	// Main Extension Export
+	// ---------------------------------------------------------------------------
 
-	if (["remove", "switch", "rename", "rebase", "tip", "pr"].includes(sub) && gitRoot) {
-		const statuses = await getAllWorktreeStatuses(gitRoot);
-		const branchMatches = statuses
-			.filter((s) => (["rebase", "tip", "pr"].includes(sub) ? isRebaseTarget(s) : !s.isMain) && s.branch && s.branch.startsWith(subArg))
-			.map((s) => ({
-				value: `${parts[0]} ${s.branch!}`,
-				label: s.branch!,
-				description: s.path,
-			}));
-		return branchMatches.length > 0 ? branchMatches : null;
-	}
-
-	return null;
-}
-
-// ---------------------------------------------------------------------------
-// Main Extension Export
-// ---------------------------------------------------------------------------
-
-export default function (pi: ExtensionAPI) {
 	const aliases = loadWorktreeAliases(getAgentDir());
 	const prWorkflow = new WorktreePrWorkflow({
 		run: (command, args, cwd) => exec(command, args, cwd),
@@ -1705,15 +1767,15 @@ export default function (pi: ExtensionAPI) {
 		await prWorkflow.start(args, ctx, root);
 	};
 	pi.on("session_start", () => prWorkflow.reset());
-	pi.on("session_switch", () => prWorkflow.reset());
-	pi.on("session_fork", () => prWorkflow.reset());
+	pi.on("session_before_switch", () => prWorkflow.reset());
+	pi.on("session_before_fork", () => prWorkflow.reset());
 	pi.on("session_tree", () => prWorkflow.reset());
 	pi.on("session_shutdown", () => prWorkflow.reset());
 	pi.on("agent_before_settle", (event) => prWorkflow.beforeSettle(event.outcome, event.continue));
 
 	// Primary command: /worktree
 	registerWorktreeCommands(pi, {
-		description: "Manage git worktrees with tmux (create, list, sessions, clean, remove, rename, switch, rebase, tip, pr)",
+		description: `Manage git worktrees with ${terminal?.label ?? "tmux"} (create, list, sessions, clean, remove, rename, switch, rebase, tip, pr)`,
 		getArgumentCompletions: async (prefix) => {
 			const gitRoot = await getGitRoot(process.cwd());
 			return getWorktreeArgumentCompletions(prefix, gitRoot, aliases.subcommandAliases);
@@ -1790,8 +1852,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "worktree_create",
 		label: "Create Worktree",
-		description: "Create a new git worktree with a pi agent running in tmux without prompt",
-		promptSnippet: "Create a git worktree and start pi agent in tmux",
+		description: `Create a new git worktree with a pi agent running in ${terminal?.label ?? "tmux"} without prompt`,
+		promptSnippet: `Create a git worktree and start pi agent in ${terminal?.label ?? "tmux"}`,
 		promptGuidelines: [
 			"Use worktree_create when the user asks to create an isolated worktree for a branch or feature.",
 		],
@@ -1805,6 +1867,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: "Error: Not inside a git repository." }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
@@ -1819,13 +1882,14 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Failed to create worktree: ${res.error}` }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
 			const outputText = [
 				`Successfully created worktree for branch "${res.branch}"`,
 				`Path: ${res.worktreePath}`,
-				res.isInsideTmux
+				terminal && res.terminalTarget ? terminal.describe(res.terminalTarget) : res.isInsideTmux
 					? `Tmux Window: ${res.tmuxTarget || `wt:${params.branchName}`}`
 					: `Tmux Session: ${res.tmuxTarget}`,
 				"Pi is running in the worktree in interactive mode.",
@@ -1837,6 +1901,7 @@ export default function (pi: ExtensionAPI) {
 					worktreePath: res.worktreePath,
 					branch: res.branch,
 					tmuxTarget: res.tmuxTarget,
+					...(res.terminalTarget ? { terminalTarget: res.terminalTarget } : {}),
 				},
 			};
 		},
@@ -1845,7 +1910,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "worktree_list",
 		label: "List Worktrees",
-		description: "List all git worktrees with their branches and tmux status",
+		description: `List all git worktrees with their branches and ${terminal?.label ?? "tmux"} status`,
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const gitRoot = await getGitRoot(ctx.cwd);
@@ -1853,6 +1918,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: "Error: Not inside a git repository." }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
@@ -1877,6 +1943,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: "Error: Not inside a git repository." }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
@@ -1910,6 +1977,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: "Error: Not inside a git repository." }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
@@ -1918,6 +1986,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Failed to remove worktree: ${res.error}` }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
@@ -1942,6 +2011,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: "Error: Not inside a git repository." }],
 					isError: true,
+					details: undefined,
 				};
 			}
 
@@ -1950,6 +2020,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Failed to rename branch: ${res.error}` }],
 					isError: true,
+					details: undefined,
 				};
 			}
 

@@ -1,0 +1,29 @@
+{
+	"name": "pi-extension-worktree-rex",
+	"version": "0.1.0",
+	"description": "pi extension: manage git worktrees with Rex tabs running interactive pi agents",
+	"type": "module",
+	"private": true,
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"worktree",
+		"rex"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/worktree-rex"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}

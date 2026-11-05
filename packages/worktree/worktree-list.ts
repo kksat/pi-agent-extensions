@@ -19,6 +19,8 @@ export interface ListedWorktree {
 	isMain: boolean;
 	isManaged: boolean;
 	tmuxActive: boolean;
+	terminalActive?: boolean;
+	terminalLabel?: string;
 }
 
 export type ListCommand = "create" | "list" | "sessions" | "switch" | "rebase" | "tip" | "pr" | "rename" | "remove" | "clean" | "help";
@@ -134,7 +136,7 @@ export class WorktreeList implements Component, Focusable {
 	private refreshMatches(): void {
 		this.items = fuzzyFilter(this.options.worktrees, this.input.getValue(), (wt) => `${wt.branch ?? "(detached)"} ${wt.path}`).map((wt) => ({
 			value: wt.path,
-			label: `${wt.branch ?? "(detached)"} ${wt.isMain ? "[main]" : wt.isManaged ? "[managed]" : "[external]"}${wt.tmuxActive ? " ⚡ tmux:active" : ""}`,
+			label: `${wt.branch ?? "(detached)"} ${wt.isMain ? "[main]" : wt.isManaged ? "[managed]" : "[external]"}${wt.terminalActive ? ` ⚡ ${wt.terminalLabel}:active` : wt.tmuxActive ? " ⚡ tmux:active" : ""}`,
 			description: wt.path,
 		}));
 		this.createList();
@@ -246,7 +248,7 @@ export class WorktreeList implements Component, Focusable {
 			...this.list.render(width),
 			"",
 			theme.fg("muted", wt ? `Path: ${wt.path}` : "No worktree selected"),
-			theme.fg("muted", wt ? `Commit: ${wt.commit?.slice(0, 8) ?? "—"}${wt.tmuxActive ? " · tmux:active" : ""}${wt.locked ? " · locked" : ""}${wt.prunable ? " · prunable" : ""}${wt.bare ? " · bare" : ""}` : ""),
+			theme.fg("muted", wt ? `Commit: ${wt.commit?.slice(0, 8) ?? "—"}${wt.terminalActive ? ` · ${wt.terminalLabel}:active` : wt.tmuxActive ? " · tmux:active" : ""}${wt.locked ? " · locked" : ""}${wt.prunable ? " · prunable" : ""}${wt.bare ? " · bare" : ""}` : ""),
 			theme.fg("warning", this.message || (conflicts ? `Conflicting bindings: ${conflicts}` : "")),
 			...hints.map((hint) => theme.fg("dim", hint)),
 			...this.border.render(width),
