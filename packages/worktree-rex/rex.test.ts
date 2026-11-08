@@ -306,3 +306,89 @@ test("clean removes managed Rex tabs and branches but retains history", async (t
 	assert.deepEqual(f.registry().worktrees, {});
 	assert.equal(f.registry().known[0].path, f.checkout);
 });
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error("condition not met in time");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+interface InputHandler {
+	(data: string): { consume?: boolean; data?: string } | undefined;
+}
+
+function hotkeySession(
+	notifications: Array<{ message: string; level?: string }>,
+	terminal: ReturnType<typeof server>["terminal"],
+	cwd: string,
+) {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	const pi = {
+		registerCommand: () => {},
+		registerTool: () => {},
+		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+			handlers.set(event, handler);
+			return () => handlers.delete(event);
+		},
+	} as unknown as ExtensionAPI;
+	extension(pi, terminal);
+	let input: InputHandler | undefined;
+	let unsubscribed = false;
+	const ctx = {
+		cwd,
+		mode: "tui",
+		ui: {
+			notify: (message: string, level?: string) => notifications.push({ message, level }),
+			onTerminalInput: (handler: InputHandler) => {
+				input = handler;
+				return () => {
+					unsubscribed = true;
+				};
+			},
+			custom: async () => "topic",
+			select: async () => undefined,
+		},
+	} as unknown as ExtensionContext;
+	handlers.get("session_start")!(undefined, ctx);
+	assert.ok(input, "session_start must register a terminal input handler");
+	return { handlers, input: () => input!, unsubscribed: () => unsubscribed };
+}
+
+test("alt+w jumps to the worktree's Rex tab and spawns a replacement when none exists", async (t) => {
+	const f = fixture(t);
+	const notifications: Array<{ message: string; level?: string }> = [];
+	await f.invoke("worktree_create", { branchName: "topic" });
+	const hotkey = hotkeySession(notifications, f.terminal, f.root);
+
+	// Unrelated keys pass through untouched, including a bare escape.
+	assert.equal(hotkey.input()("w"), undefined);
+	assert.equal(hotkey.input()("\x1b"), undefined);
+
+	// The recorded tab is focused without spawning a duplicate.
+	assert.deepEqual(hotkey.input()("\x1bw"), { consume: true });
+	await waitFor(() => f.state.active === target.windowId);
+	assert.equal(f.windows.size, 1, "no duplicate tab may be spawned");
+	assert.match(notifications.at(-1)!.message, /Switched to Rex tab/);
+
+	// A closed tab is replaced, and the registry records the new target.
+	f.windows.clear();
+	f.state.active = "window:keep";
+	hotkey.input()("\x1bw");
+	await waitFor(() => f.state.active === target.windowId && f.windows.size === 1);
+	assert.deepEqual(f.registry().worktrees.topic.terminal, target);
+	assert.equal(hotkey.unsubscribed(), false);
+
+	// Shutdown stops the hotkey.
+	hotkey.handlers.get("session_shutdown")!(undefined, undefined);
+	assert.equal(hotkey.unsubscribed(), true);
+});
+
+test("alt+w outside a git repository only reports an error", async (t) => {
+	const f = fixture(t);
+	const notifications: Array<{ message: string; level?: string }> = [];
+	const hotkey = hotkeySession(notifications, f.terminal, path.dirname(f.root));
+	assert.deepEqual(hotkey.input()("\x1bw"), { consume: true });
+	await waitFor(() => notifications.some((n) => /not inside a git repository/.test(n.message)));
+});

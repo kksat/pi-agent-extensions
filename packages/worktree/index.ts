@@ -61,8 +61,18 @@ import { toWorktreeSessionRow, type WorktreeSessionRow } from "./session-query.t
 
 import type { TerminalTarget, WorktreeTerminal } from "./terminal.ts";
 
+/** Operations the worktree workflow exposes to its host package, such as a global hotkey. */
+export interface WorktreeApi {
+	/**
+	 * Pick a worktree and move to its terminal tab, spawning one when missing.
+	 * Accepts event contexts such as the `session_start` payload; outside a git
+	 * repository it only notifies.
+	 */
+	switchWorktree(ctx: ExtensionContext): Promise<void>;
+}
+
 /** Registers the worktree workflow; alternative packages supply their terminal transport. */
-export default function registerWorktree(pi: ExtensionAPI, terminal?: WorktreeTerminal) {
+export default function registerWorktree(pi: ExtensionAPI, terminal?: WorktreeTerminal): WorktreeApi {
 const WORKTREE_REGISTRY_FILE = terminal?.registryFile ?? "worktrees.json";
 	const WORKTREE_ENTRY_TYPE = "worktree-entry";
 
@@ -1620,7 +1630,7 @@ const WORKTREE_REGISTRY_FILE = terminal?.registryFile ?? "worktrees.json";
 		ctx.ui.notify(`✓ Renamed branch "${oldBranch}" → "${newBranch}".`, "info");
 	}
 
-	async function handleSwitchCommand(args: string, ctx: ExtensionCommandContext, gitRoot: string): Promise<void> {
+	async function handleSwitchCommand(args: string, ctx: ExtensionContext, gitRoot: string): Promise<void> {
 		let branch = args.trim();
 
 		if (!branch) {
@@ -2035,4 +2045,15 @@ const WORKTREE_REGISTRY_FILE = terminal?.registryFile ?? "worktrees.json";
 			};
 		},
 	});
+
+	return {
+		async switchWorktree(ctx: ExtensionContext): Promise<void> {
+			const gitRoot = await getGitRoot(ctx.cwd);
+			if (!gitRoot) {
+				ctx.ui.notify("Current directory is not inside a git repository.", "error");
+				return;
+			}
+			await handleSwitchCommand("", ctx, gitRoot);
+		},
+	};
 }

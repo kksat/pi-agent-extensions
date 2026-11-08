@@ -79,6 +79,24 @@ If more than one app is connected, choose one from `rex client ls` and set
 `REX_CLIENT` before starting Pi. Cross-session switching uses that client; the
 plugin reports ambiguity rather than selecting an arbitrary app.
 
+## Switch with a keybinding
+
+Press `alt+w` in Pi to open the worktree picker. Selecting a worktree jumps
+Rex to its tab; when no tab runs in that checkout, the keybinding opens a
+replacement tab first, exactly like `/worktree switch`. Unrelated keys pass
+through untouched, and outside a git repository the keybinding only reports an
+error.
+
+The key is configurable in the agent directory's `keybindings.json` under the
+`worktree.switch` id, alongside the `worktree.list.*` bindings the list view
+uses. Remap it to another key, or set an empty list to disable it:
+
+```json
+{
+  "worktree.switch": ["alt+w", "alt+shift+w"]
+}
+```
+
 ## Commands and tools
 
 The package preserves these commands:
