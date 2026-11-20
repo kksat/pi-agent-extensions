@@ -1,0 +1,29 @@
+{
+	"name": "pi-extension-tokens-per-minute",
+	"version": "0.1.0",
+	"description": "pi extension: show tokens per minute in the bottom status bar",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"status-bar",
+		"usage"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/tokens-per-minute"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}
