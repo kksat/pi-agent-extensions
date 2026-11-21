@@ -1,0 +1,33 @@
+{
+	"name": "pi-extension-conversation-editor",
+	"version": "0.1.0",
+	"description": "pi extension: open the whole conversation in an external editor, positioned where the transcript is on screen",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"editor",
+		"transcript",
+		"reading"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kksat/pi-agent-extensions.git",
+		"directory": "packages/conversation-editor"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"test": "node --test test.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"license": "GPL-3.0-only"
+}

@@ -14,6 +14,7 @@ A collection of custom [pi](https://pi.dev) packages, each installable separatel
 | [`packages/cmux-notify`](./packages/cmux-notify) | Notify cmux when a turn settles and the user needs to act |
 | [`packages/tmux-attention`](./packages/tmux-attention) | Mark tmux window names when Pi needs attention; clear on selection or focus |
 | [`packages/tokens-per-minute`](./packages/tokens-per-minute) | Show tokens per minute in the bottom status bar |
+| [`packages/conversation-editor`](./packages/conversation-editor) | Open the whole conversation in an external editor (ctrl+alt+g) |
 
 ## Install
 
@@ -29,6 +30,7 @@ pi install ~/dev/pi-agent-extensions/packages/calm
 pi install ~/dev/pi-agent-extensions/packages/cmux-notify
 pi install ~/dev/pi-agent-extensions/packages/tmux-attention
 pi install ~/dev/pi-agent-extensions/packages/tokens-per-minute
+pi install ~/dev/pi-agent-extensions/packages/conversation-editor
 ```
 
 To use Rex instead of tmux, install `packages/worktree-rex` in place of
